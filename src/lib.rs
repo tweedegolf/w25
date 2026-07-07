@@ -83,19 +83,18 @@ impl<Series: NorSeries, SPI, HOLD, WP> W25<Series, SPI, HOLD, WP> {
     }
 }
 
-impl<Series: NorSeries, SPI, S: Debug, P: Debug, HOLD, WP>
-    W25<Series, SPI, HOLD, WP>
+impl<Series: NorSeries, SPI, S: Debug, P: Debug, HOLD, WP> W25<Series, SPI, HOLD, WP>
 where
     SPI: embedded_hal::spi::ErrorType<Error = S>,
     HOLD: OutputPin<Error = P>,
     WP: OutputPin<Error = P>,
 {
     /// Create a new instance of the flash.
-    /// 
+    ///
     /// The capacity must be the total chip capacity.
     /// Weird things can happen if you provide the wrong value.
     /// No checks are done, you're believed at your word.
-    pub fn new(spi: SPI, hold: HOLD, wp: WP, capacity: u32) -> Result<Self, Error<S, P>> {
+    pub fn new(spi: SPI, hold: HOLD, wp: WP, capacity: u32) -> Result<Self, P> {
         let mut flash = W25 {
             spi,
             hold,
@@ -104,8 +103,8 @@ where
             _pantom: PhantomData,
         };
 
-        flash.hold.set_high().map_err(Error::PinError)?;
-        flash.wp.set_high().map_err(Error::PinError)?;
+        flash.hold.set_high()?;
+        flash.wp.set_high()?;
 
         Ok(flash)
     }
@@ -116,9 +115,8 @@ where
     /// By default this means the pin needs to be high (true).
     ///
     /// This function sets the pin directly and can cause the chip to not work.
-    pub fn set_hold(&mut self, value: PinState) -> Result<(), Error<S, P>> {
-        self.hold.set_state(value).map_err(Error::PinError)?;
-        Ok(())
+    pub fn set_hold(&mut self, value: PinState) -> Result<(), P> {
+        self.hold.set_state(value)
     }
 
     /// Set the write protect pin state.
@@ -127,20 +125,36 @@ where
     /// By default this means the pin needs to be high (true).
     ///
     /// This function sets the pin directly and can cause the chip to not work.
-    pub fn set_wp(&mut self, value: PinState) -> Result<(), Error<S, P>> {
-        self.wp.set_state(value).map_err(Error::PinError)?;
-        Ok(())
+    pub fn set_wp(&mut self, value: PinState) -> Result<(), P> {
+        self.wp.set_state(value)
     }
 }
 
-impl<Series: NorSeries, SPI, S: Debug, P: Debug, HOLD, WP> ErrorType
-    for W25<Series, SPI, HOLD, WP>
+impl<Series: NorSeries, SPI, S: Debug> W25<Series, SPI, (), ()>
 where
     SPI: embedded_hal::spi::ErrorType<Error = S>,
-    HOLD: OutputPin<Error = P>,
-    WP: OutputPin<Error = P>,
 {
-    type Error = Error<S, P>;
+    /// Create a new instance of the flash, but without the nHold and nWP pins.
+    ///
+    /// The capacity must be the total chip capacity.
+    /// Weird things can happen if you provide the wrong value.
+    /// No checks are done, you're believed at your word.
+    pub fn new_no_pins(spi: SPI, capacity: u32) -> Self {
+        Self {
+            spi,
+            hold: (),
+            wp: (),
+            capacity,
+            _pantom: PhantomData,
+        }
+    }
+}
+
+impl<Series: NorSeries, SPI, S: Debug, HOLD, WP> ErrorType for W25<Series, SPI, HOLD, WP>
+where
+    SPI: embedded_hal::spi::ErrorType<Error = S>,
+{
+    type Error = Error<S>;
 }
 
 /// Custom error type for the various errors that can be thrown by driver.
@@ -148,11 +162,9 @@ where
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
-pub enum Error<S: Debug, P: Debug> {
+pub enum Error<S: Debug> {
     /// Something went wrong with the SPI
     SpiError(S),
-    /// Something went wrong with the WP or HOLD pin
-    PinError(P),
     /// An operation was not aligned
     NotAligned,
     /// An operation was out of bounds
@@ -161,7 +173,7 @@ pub enum Error<S: Debug, P: Debug> {
     WriteEnableFail,
 }
 
-impl<S: Debug, P: Debug> NorFlashError for Error<S, P> {
+impl<S: Debug> NorFlashError for Error<S> {
     fn kind(&self) -> NorFlashErrorKind {
         match self {
             Error::NotAligned => NorFlashErrorKind::NotAligned,
