@@ -1,6 +1,6 @@
 [package]
 name = "w25"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "An embedded-hal-async driver for the W25 series"

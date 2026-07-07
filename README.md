@@ -22,6 +22,11 @@ This crate is adopted from <https://github.com/tweedegolf/w25q32jv>
 
 ### Unreleased
 
+### 0.7.0 2026-07-07
+
+- Added a no-pin constructor
+- *breaking*: Removed the pin error variant from the error enum
+
 ### 0.6.0 2025-07-07
 
 - Continued from <https://github.com/tweedegolf/w25q32jv> 0.5.1
