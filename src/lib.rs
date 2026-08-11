@@ -6,6 +6,7 @@
 use core::{fmt::Debug, marker::PhantomData};
 use derive_more::TryFrom;
 use embedded_hal::digital::{OutputPin, PinState};
+use embedded_hal_async::spi::SpiDevice;
 use embedded_storage::nor_flash::{ErrorType, NorFlashError, NorFlashErrorKind};
 
 mod commands_impl;
@@ -93,7 +94,7 @@ where
 {
     /// Create a new instance of the flash.
     ///
-    /// The capacity must be the total chip capacity.
+    /// The capacity must be the total chip capacity in bytes.
     /// Weird things can happen if you provide the wrong value.
     /// No checks are done, you're believed at your word.
     pub fn new(spi: SPI, hold: HOLD, wp: WP, capacity: u32) -> Result<Self, P> {
@@ -152,6 +153,67 @@ where
     }
 }
 
+/// Errors that can occur during autodetect initialization.
+#[derive(Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[non_exhaustive]
+pub enum AutodetectError<S: Debug, P: Debug> {
+    /// Something went wrong with the flash device
+    DeviceError(Error<S>),
+    /// Something went wrong with a pin
+    PinError(P),
+    /// Device reported that it was not manufactured by Winbond
+    ManufacturerNotRecognized(u8),
+    /// The device ID did not match any known devices
+    DeviceNotRecognized(u8),
+}
+
+impl<S: Debug, P: Debug> From<Error<S>> for AutodetectError<S, P> {
+    fn from(value: Error<S>) -> Self {
+        Self::DeviceError(value)
+    }
+}
+
+impl<Series: NorSeries, SPI, S: Debug, P: Debug, HOLD, WP> W25<Series, SPI, HOLD, WP>
+where
+    SPI: SpiDevice<Error = S>,
+    HOLD: OutputPin<Error = P>,
+    WP: OutputPin<Error = P>,
+{
+    /// Create a new instance of the flash, autodetecting the chip variant and capacity.
+    pub async fn new_autodetect(
+        spi: SPI,
+        hold: HOLD,
+        wp: WP,
+    ) -> Result<Self, AutodetectError<S, P>> {
+        let mut flash = W25 {
+            spi,
+            hold,
+            wp,
+            capacity: 0, // For now do not set the capacity of the device, as we do not know yet.
+            _pantom: PhantomData,
+        };
+
+        flash.hold.set_high().map_err(AutodetectError::PinError)?;
+        flash.wp.set_high().map_err(AutodetectError::PinError)?;
+
+        let jedec_id = flash.jedec_id().await?;
+        let manufacturer = jedec_id.manufacturer();
+        if jedec_id.manufacturer() != JedecId::MANUFACTURER {
+            return Err(AutodetectError::ManufacturerNotRecognized(manufacturer));
+        }
+
+        let major_device_id = jedec_id
+            .major_device_id()
+            .map_err(AutodetectError::DeviceNotRecognized)?;
+
+        // Update the capacity.
+        flash.capacity = major_device_id.capacity();
+
+        Ok(flash)
+    }
+}
+
 impl<Series: NorSeries, SPI, S: Debug, HOLD, WP> ErrorType for W25<Series, SPI, HOLD, WP>
 where
     SPI: embedded_hal::spi::ErrorType<Error = S>,
@@ -201,6 +263,7 @@ fn command_and_address(command: u8, address: u32) -> [u8; 4] {
 /// Note that the repr value corresponds to the Manufacturer/DeviceID command (0x90) and not the JEDEC ID (0x9F).
 /// The latter is the same value, but incremented by one.
 #[derive(Debug, Clone, Copy, TryFrom)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[repr(u8)]
 #[try_from(repr)]
 pub enum MajorDeviceId {
@@ -232,10 +295,37 @@ pub enum MajorDeviceId {
     W25_02 = 0x21,
 }
 
+impl MajorDeviceId {
+    /// Capacity of a device that has the identifier assigned, in bytes.
+    pub const fn capacity(&self) -> u32 {
+        let capacity_kilobits = match *self {
+            MajorDeviceId::W25_05 => 512,
+            MajorDeviceId::W25_10 => 1024,
+            MajorDeviceId::W25_20 => 2 * 1024,
+            MajorDeviceId::W25_40 => 4 * 1024,
+            MajorDeviceId::W25_80 => 8 * 1024,
+            MajorDeviceId::W25_16 => 16 * 1024,
+            MajorDeviceId::W25_32 => 32 * 1024,
+            MajorDeviceId::W25_64 => 64 * 1024,
+            MajorDeviceId::W25_128 => 128 * 1024,
+            MajorDeviceId::W25_256 => 256 * 1024,
+            MajorDeviceId::W25_512 => 512 * 1024,
+            MajorDeviceId::W25_01 => 1024 * 1024,
+            MajorDeviceId::W25_02 => 2 * 1024 * 1024,
+        };
+
+        const FACTOR_KILOBITS_BYTES: u32 = 1024 / 8;
+        capacity_kilobits * FACTOR_KILOBITS_BYTES
+    }
+}
+
 /// Result from the
 pub struct JedecId([u8; 3]);
 
 impl JedecId {
+    /// ID assigned to Winbond.
+    pub const MANUFACTURER: u8 = 0xEF;
+
     /// Manufacturer byte of the [JedecId].
     ///
     /// Should always be 0xEF for Winbond.
@@ -253,7 +343,7 @@ impl JedecId {
     }
 
     /// Return the minor device identifier ID8-15, denoting the package and variant of the chip.
-    pub fn minor_device_id(&self) -> u8 {
+    pub const fn minor_device_id(&self) -> u8 {
         self.0[1]
     }
 }

@@ -22,6 +22,8 @@ This crate is adopted from <https://github.com/tweedegolf/w25q32jv>
 
 ### Unreleased
 
+- Added fetching JEDEC ID & constructor which autodetects the chip capacity.
+
 ### 0.7.0 2026-07-07
 
 - Added a no-pin constructor
