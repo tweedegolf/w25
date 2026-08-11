@@ -16,6 +16,7 @@ embedded-hal = "1.0"
 embedded-hal-async = "1.0"
 embedded-storage = "0.3"
 embedded-storage-async = "0.4"
+derive_more = { version = "2.1", default-features = false, features = ["try_from"] }
 
 [features]
 defmt = ["dep:defmt"]

@@ -83,6 +83,19 @@ where
         Ok(TryFrom::try_from(&buf[5..]).unwrap())
     }
 
+    /// Request the 24 bit JEDEC ID that is specific to this chip variant.
+    pub async fn jedec_id(&mut self) -> Result<JedecId, Error<S>> {
+        let mut buf = [0; 4];
+        buf[0] = Command::JedecId as u8;
+
+        self.spi
+            .transfer_in_place(&mut buf)
+            .await
+            .map_err(Error::SpiError)?;
+
+        Ok(JedecId(TryFrom::try_from(&buf[1..]).unwrap()))
+    }
+
     /// Reset the chip
     pub async fn reset(&mut self) -> Result<(), Error<S>>
     where
