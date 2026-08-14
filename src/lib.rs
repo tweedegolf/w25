@@ -261,7 +261,7 @@ fn command_and_address(command: u8, address: u32) -> [u8; 4] {
 /// Major byte of the device identification (ID7-ID0) denoting chip capacity.
 ///
 /// Note that the repr value corresponds to the Manufacturer/DeviceID command (0x90) and not the JEDEC ID (0x9F).
-/// The latter is the same value, but incremented by one.
+/// The latter is the same value, but incremented by one (with exception of W25_512, which is incremented by seven).
 #[derive(Debug, Clone, Copy, TryFrom)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[repr(u8)]
@@ -338,8 +338,12 @@ impl JedecId {
     /// If the ID does not match any known device, returns the **original** JEDEC Major Device ID,
     /// which is incremented by one compared to the value returned by the Manufacturer/DeviceID command (0x90).
     pub fn major_device_id(&self) -> Result<MajorDeviceId, u8> {
-        let b = self.0[2];
-        MajorDeviceId::try_from(b.checked_sub(1).ok_or(b)?).map_err(|_e| b)
+        let b_jedec = self.0[2];
+        let b_device_id = match b_jedec {
+            0x20 => 0x19, // Note W25_512 has JEDEC ID 0x20 and not 0x1F.
+            _ => b_jedec.checked_sub(1).ok_or(b_jedec)?,
+        };
+        MajorDeviceId::try_from(b_device_id).map_err(|_e| b_jedec)
     }
 
     /// Return the minor device identifier ID8-15, denoting the package and variant of the chip.
