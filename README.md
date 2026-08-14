@@ -22,6 +22,8 @@ This crate is adopted from <https://github.com/tweedegolf/w25q32jv>
 
 ### Unreleased
 
+### 0.7.2 2026-08-14
+
 - Fixed autodetect issue for W25[qx]512.
 
 ### 0.7.1 2026-08-11
