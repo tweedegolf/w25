@@ -63,7 +63,7 @@ where
 
     /// The flash chip is unable to perform new commands while it is still working on a previous one. Especially erases take a long time.
     /// This function returns true while the chip is unable to respond to commands (with the exception of the busy command).
-    async fn busy(&mut self) -> Result<bool, Error<S>> {
+    pub(crate) async fn busy(&mut self) -> Result<bool, Error<S>> {
         Ok((self.read_status_register().await? & 0x01) != 0)
     }
 

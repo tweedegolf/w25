@@ -5,6 +5,7 @@
 
 use core::{fmt::Debug, marker::PhantomData};
 use derive_more::TryFrom;
+use embassy_futures::yield_now;
 use embedded_hal::digital::{OutputPin, PinState};
 use embedded_hal_async::spi::SpiDevice;
 use embedded_storage::nor_flash::{ErrorType, NorFlashError, NorFlashErrorKind};
@@ -88,7 +89,7 @@ impl<Series: NorSeries, SPI, HOLD, WP> W25<Series, SPI, HOLD, WP> {
 
 impl<Series: NorSeries, SPI, S: Debug, P: Debug, HOLD, WP> W25<Series, SPI, HOLD, WP>
 where
-    SPI: embedded_hal::spi::ErrorType<Error = S>,
+    SPI: embedded_hal::spi::ErrorType<Error = S> + embedded_hal_async::spi::SpiDevice,
     HOLD: OutputPin<Error = P>,
     WP: OutputPin<Error = P>,
 {
@@ -97,7 +98,7 @@ where
     /// The capacity must be the total chip capacity in bytes.
     /// Weird things can happen if you provide the wrong value.
     /// No checks are done, you're believed at your word.
-    pub fn new(spi: SPI, hold: HOLD, wp: WP, capacity: u32) -> Result<Self, P> {
+    pub async fn new(spi: SPI, hold: HOLD, wp: WP, capacity: u32) -> Result<Self, InitError<S, P>> {
         let mut flash = W25 {
             spi,
             hold,
@@ -106,8 +107,15 @@ where
             _pantom: PhantomData,
         };
 
-        flash.hold.set_high()?;
-        flash.wp.set_high()?;
+        flash.hold.set_high().map_err(InitError::PinError)?;
+        flash.wp.set_high().map_err(InitError::PinError)?;
+
+        // Ensure the device is not busy from before a MCU restart
+        while flash.busy().await? {
+            // Avoid starving the executor when the SPI is
+            // fast enough for the busy check to not yield
+            yield_now().await;
+        }
 
         Ok(flash)
     }
@@ -135,21 +143,30 @@ where
 
 impl<Series: NorSeries, SPI, S: Debug> W25<Series, SPI, (), ()>
 where
-    SPI: embedded_hal::spi::ErrorType<Error = S>,
+    SPI: embedded_hal::spi::ErrorType<Error = S> + embedded_hal_async::spi::SpiDevice,
 {
     /// Create a new instance of the flash, but without the nHold and nWP pins.
     ///
     /// The capacity must be the total chip capacity.
     /// Weird things can happen if you provide the wrong value.
     /// No checks are done, you're believed at your word.
-    pub fn new_no_pins(spi: SPI, capacity: u32) -> Self {
-        Self {
+    pub async fn new_no_pins(spi: SPI, capacity: u32) -> Result<Self, Error<S>> {
+        let mut flash = Self {
             spi,
             hold: (),
             wp: (),
             capacity,
             _pantom: PhantomData,
+        };
+
+        // Ensure the device is not busy from before a MCU restart
+        while flash.busy().await? {
+            // Avoid starving the executor when the SPI is
+            // fast enough for the busy check to not yield
+            yield_now().await;
         }
+
+        Ok(flash)
     }
 }
 
@@ -157,7 +174,7 @@ where
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
-pub enum AutodetectError<S: Debug, P: Debug> {
+pub enum InitError<S: Debug, P: Debug> {
     /// Something went wrong with the flash device
     DeviceError(Error<S>),
     /// Something went wrong with a pin
@@ -168,7 +185,7 @@ pub enum AutodetectError<S: Debug, P: Debug> {
     DeviceNotRecognized(u8),
 }
 
-impl<S: Debug, P: Debug> From<Error<S>> for AutodetectError<S, P> {
+impl<S: Debug, P: Debug> From<Error<S>> for InitError<S, P> {
     fn from(value: Error<S>) -> Self {
         Self::DeviceError(value)
     }
@@ -181,11 +198,7 @@ where
     WP: OutputPin<Error = P>,
 {
     /// Create a new instance of the flash, autodetecting the chip variant and capacity.
-    pub async fn new_autodetect(
-        spi: SPI,
-        hold: HOLD,
-        wp: WP,
-    ) -> Result<Self, AutodetectError<S, P>> {
+    pub async fn new_autodetect(spi: SPI, hold: HOLD, wp: WP) -> Result<Self, InitError<S, P>> {
         let mut flash = W25 {
             spi,
             hold,
@@ -194,21 +207,28 @@ where
             _pantom: PhantomData,
         };
 
-        flash.hold.set_high().map_err(AutodetectError::PinError)?;
-        flash.wp.set_high().map_err(AutodetectError::PinError)?;
+        flash.hold.set_high().map_err(InitError::PinError)?;
+        flash.wp.set_high().map_err(InitError::PinError)?;
 
         let jedec_id = flash.jedec_id().await?;
         let manufacturer = jedec_id.manufacturer();
         if jedec_id.manufacturer() != JedecId::MANUFACTURER {
-            return Err(AutodetectError::ManufacturerNotRecognized(manufacturer));
+            return Err(InitError::ManufacturerNotRecognized(manufacturer));
         }
 
         let major_device_id = jedec_id
             .major_device_id()
-            .map_err(AutodetectError::DeviceNotRecognized)?;
+            .map_err(InitError::DeviceNotRecognized)?;
 
         // Update the capacity.
         flash.capacity = major_device_id.capacity();
+
+        // Ensure the device is not busy from before a MCU restart
+        while flash.busy().await? {
+            // Avoid starving the executor when the SPI is
+            // fast enough for the busy check to not yield
+            yield_now().await;
+        }
 
         Ok(flash)
     }
