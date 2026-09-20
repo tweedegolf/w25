@@ -22,6 +22,12 @@ This crate is adopted from <https://github.com/tweedegolf/w25q32jv>
 
 ### Unreleased
 
+### 0.8.0 2026-09-20
+
+- dont unwrap when we can return the error - #6
+- Yield in the busy loops to avoid executor starvation - #8
+- *Breaking:* Await idle in constructor - #9
+
 ### 0.7.2 2026-08-14
 
 - Fixed autodetect issue for W25[qx]512.
