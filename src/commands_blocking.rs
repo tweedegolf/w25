@@ -110,7 +110,8 @@ impl<Series: NorSeries, SPI, S: Debug, HOLD, WP> W25<Series, SPI, HOLD, WP>
 where
     SPI: SpiDevice<Error = S>,
 {
-    fn read_status_register_blocking(&mut self) -> Result<u8, Error<S>> {
+    /// Read Status Register 1 (0x05, blocking).
+    pub fn read_status_register1_blocking(&mut self) -> Result<u8, Error<S>> {
         let mut buf: [u8; 2] = [Command::ReadStatusRegister1 as u8, 0];
 
         self.spi
@@ -125,14 +126,22 @@ where
     /// This function returns true while the chip is unable to respond to
     /// commands (with the exception of the busy command).
     pub(crate) fn busy_blocking(&mut self) -> Result<bool, Error<S>> {
-        Ok((self.read_status_register_blocking()? & 0x01) != 0)
+        Ok((self.read_status_register1_blocking()? & 0x01) != 0)
     }
 
     fn write_enabled_blocking(&mut self) -> Result<bool, Error<S>> {
-        Ok((self.read_status_register_blocking()? & 0x02) != 0)
+        Ok((self.read_status_register1_blocking()? & 0x02) != 0)
     }
 
-    /// Request the 64 bit id that is unique to this chip (blocking).
+    /// Explicitely resets the Write Enable Latch (WEL) bit in Status Register 1
+    /// to 0 (0x04, blocking).
+    pub fn disable_write_blocking(&mut self) -> Result<(), Error<S>> {
+        self.spi
+            .write(&[Command::WriteDisable as u8])
+            .map_err(Error::SpiError)
+    }
+
+    /// Request the 64 bit id that is unique to this chip (0x4B, blocking).
     pub fn device_id_blocking(&mut self) -> Result<[u8; 8], Error<S>> {
         let mut buf: [u8; 13] = [0; 13];
         buf[0] = Command::UniqueId as u8;
@@ -144,7 +153,8 @@ where
         Ok(TryFrom::try_from(&buf[5..]).unwrap())
     }
 
-    /// Request the 24-bit JEDEC ID that is specific to this chip variant (blocking).
+    /// Request the 24-bit JEDEC ID that is specific to this chip variant
+    /// (0x9F, blocking).
     pub fn jedec_id_blocking(&mut self) -> Result<JedecId, Error<S>> {
         let mut buf = [Command::JedecId as u8, 0, 0, 0];
 
@@ -155,7 +165,19 @@ where
         Ok(JedecId(TryFrom::try_from(&buf[1..]).unwrap()))
     }
 
-    /// Reset the chip (blocking).
+    /// Read Manufacturer and Device Id (0x90, blocking).
+    /// Returns (`manufacturer_id, device_id`).
+    pub async fn manufacturer_device_id_blocking(&mut self) -> Result<(u8, u8), Error<S>> {
+        let mut buf: [u8; 6] = [Command::ManufacturerDeviceId as u8, 0, 0, 0, 0, 0];
+
+        self.spi
+            .transfer_in_place(&mut buf)
+            .map_err(Error::SpiError)?;
+
+        Ok((buf[4], buf[5]))
+    }
+
+    /// Reset the chip (0x66 followed by 0x99, blocking).
     pub fn reset_blocking(&mut self) -> Result<(), Error<S>>
     where
         Series: Reset,
@@ -165,11 +187,23 @@ where
             .map_err(Error::SpiError)?;
         self.spi
             .write(&[Command::Reset as u8])
-            .map_err(Error::SpiError)?;
-        Ok(())
+            .map_err(Error::SpiError)
     }
 
-    /// Reads a chunk of bytes from the flash chip (blocking).
+    /// Reset Continuous Read Mode (0xFFFF, blocking) to return the device to normal SPI
+    /// command recognition.
+    ///
+    /// Sending 16 clocks of all 1s (`[0xFF, 0xFF]`) safely resets both Quad I/O
+    /// (which needs 8 clocks) and Dual I/O (which needs 16) Continuous Read
+    /// Modes accross Q and X series.
+    pub async fn mode_bit_reset_blocking(&mut self) -> Result<(), Error<S>> {
+        self.spi
+            .write(&[Command::ModeBitReset as u8, Command::ModeBitReset as u8])
+            .map_err(Error::SpiError)
+    }
+
+    /// Reads a chunk of bytes from the flash chip (0x03, up to 33/50 MHz,
+    /// blocking).
     ///
     /// The number of bytes read is equal to the length of the buf slice.
     /// The first byte is read from the provided address. This address is then
@@ -181,22 +215,50 @@ where
     pub fn read_blocking(&mut self, address: u32, buf: &mut [u8]) -> Result<(), Error<S>> {
         self.check_read(address, buf.len())?;
 
+        if buf.is_empty() {
+            return Ok(());
+        }
+
         self.spi
             .transaction(&mut [
                 Operation::Write(&command_and_address(Command::ReadData as u8, address)),
                 Operation::Read(buf),
             ])
-            .map_err(Error::SpiError)?;
-
-        Ok(())
+            .map_err(Error::SpiError)
     }
 
-    /// Sets the enable_write flag on the flash chip to true (blocking).
+    /// Reads a chunk of bytes at the highest supported clock frequency (0x0B,
+    /// up to 104 MHz, blocking).
+    ///
+    /// The number of bytes read is equal to the length of the buf slice.  The
+    /// first byte is read from the provided address. This address is then
+    /// incremented for each following byte. Inserts 8 dummy clocks after the
+    /// 24-bit address to allow internal address setup.
+    ///
+    /// # Arguments
+    /// * `address` - Address where the first byte of the buf will be read.
+    /// * `buf` - Slice that is going to be filled with the read bytes.
+    pub async fn fast_read_blocking(&mut self, address: u32, buf: &mut [u8]) -> Result<(), Error<S>> {
+        self.check_read(address, buf.len())?;
+
+        if buf.is_empty() {
+            return Ok(());
+        }
+
+        self.spi
+            .transaction(&mut [
+                Operation::Write(&command_address_dummy(Command::FastRead as u8, address)),
+                Operation::Read(buf),
+            ])
+            .map_err(Error::SpiError)
+    }
+
+    /// Sets the enable_write flag on the flash chip to true (0x06, blocking).
     ///
     /// Writes and erases to the chip only have effect when this flag is true.
     /// Each write and erase clears the flag, requiring it to be set to true
     /// again for the next command.
-    fn enable_write_blocking(&mut self) -> Result<(), Error<S>> {
+    pub(crate) fn enable_write_blocking(&mut self) -> Result<(), Error<S>> {
         self.spi
             .write(&[Command::WriteEnable as u8])
             .map_err(Error::SpiError)?;
@@ -236,7 +298,7 @@ where
         Ok(())
     }
 
-    /// Execute a write on a single page (blocking).
+    /// Execute a write on a single page (0x02, blocking).
     fn write_page_blocking(&mut self, address: u32, buf: &[u8]) -> Result<(), Error<S>> {
         if (address & 0x000000FF) + buf.len() as u32 > Series::PAGE_SIZE {
             return Err(Error::OutOfBounds);
@@ -287,7 +349,7 @@ where
     }
 
     /// Erases a single sector of flash memory with the size of SECTOR_SIZE
-    /// (blocking).
+    /// (0x20, blocking).
     ///
     /// # Arguments
     /// * `index` - the index of the sector that needs to be erased. The address
@@ -311,7 +373,7 @@ where
     }
 
     /// Erases a single block of flash memory with the size of BLOCK_32K_SIZE
-    /// (blocking).
+    /// (0xC7, blocking).
     ///
     /// # Arguments
     /// * `index` - the index of the block that needs to be erased. The address
@@ -335,7 +397,7 @@ where
     }
 
     /// Erases a single block of flash memory with the size of BLOCK_64K_SIZE
-    /// (blocking).
+    /// (0xD8, blocking).
     ///
     /// # Arguments
     /// * `index` - the index of the block that needs to be erased. The address
@@ -358,9 +420,10 @@ where
         Ok(())
     }
 
-    /// Erases all sectors on the flash chip (blocking).
+    /// Erases all sectors on the flash chip (0xC7, blocking).
     ///
-    /// This is a very expensive operation.
+    /// NOTE: This is a very expensive operation, the order of magnitude is the
+    /// second.
     pub fn erase_chip_blocking(&mut self) -> Result<(), Error<S>> {
         self.enable_write_blocking()?;
 
@@ -373,11 +436,15 @@ where
         Ok(())
     }
 
-    /// Puts the chip into power down mode (blocking).
+    /// Puts the chip into power down mode (blocking, 0xB9).
     ///
     /// While in the power-down state, only the Release Power-down/Device ID
     /// (0xAB) instruction will be recognized. This instruction restores the
     /// device to normal operation. All other instructions are ignored.
+    ///
+    /// NOTE: The chip takes `tDP` (max 3µs) after `/CS` rises to fully enter
+    /// power-down mode.  Wait at least 3µs before issuing
+    /// `disable_power_down_mode`.
     pub fn enable_power_down_mode_blocking(&mut self) -> Result<(), Error<S>> {
         self.spi
             .write(&[Command::PowerDown as u8])
@@ -386,15 +453,187 @@ where
         Ok(())
     }
 
-    /// Releases the chip from power down mode (blocking).
+    /// Releases the chip from power-down mode (0xAB, blocking).
     ///
-    /// Restores operation from power down mode by reading the deviceID from the
+    /// Restores operation from power-down mode by reading the deviceID from the
     /// device.
+    ///
+    /// NOTE: The chip takes `tRES1` (max 3µs) after `/CS` rises to return to
+    /// standby mode.
     pub fn disable_power_down_mode_blocking(&mut self) -> Result<(), Error<S>> {
         self.spi
             .write(&[Command::ReleasePowerDown as u8])
             .map_err(Error::SpiError)?;
 
         Ok(())
+    }
+
+    /// Releases the chip from power-down mode and reads the 8-bit Device Id
+    /// (0xAB, blocking).
+    ///
+    /// Restores operation from power-down mode by reading the deviceID from the
+    /// device.
+    ///
+    /// NOTE: When reading the Electric Signature, the chip requires `tRES2`
+    /// (max 1.8µs) after `/CS` rises to resume normal standby operation.
+    pub async fn release_power_down_and_device_id_blocking(&mut self) -> Result<u8, Error<S>> {
+        let mut buf: [u8; 5] = [Command::ReleasePowerDown as u8, 0, 0, 0, 0];
+
+        self.spi
+            .transfer_in_place(&mut buf)
+            .map_err(Error::SpiError)?;
+
+        Ok(buf[4])
+    }
+}
+
+// Commands that interact with Write Protect (/WP) or Status Register 1 & 2
+// writing.
+impl<Series: NorSeries, SPI, S: Debug, HOLD, WP> W25<Series, SPI, HOLD, WP>
+where
+    SPI: SpiDevice<Error = S>,
+    HOLD: PinCapabilities,
+    WP: PinCapabilities,
+{
+    /// Writes Status Register 1 (0x01, blocking) on X-series, or preserves SR2
+    /// on Q-series.
+    ///
+    /// Handles hardware `/WP` unprotection automatically if `WP` is a connected
+    /// pin, and prevents writing 1-byte on Q-series chips (which would
+    /// accidentally clear `CMP` and `QE` in SR2).
+    pub fn write_status_register1_blocking(&mut self, sr1: u8) -> Result<(), Error<S>> {
+        if Series::HAS_SR2 {
+            // On Q-series, clocking only 8 bits into 0x01 clears CMP and QE in
+            // SR2 to 0! Read SR2 first so we can write all 16 bits and
+            // preserve SR2.
+            let mut buf = [Command::ReadStatusRegister2 as u8, 0];
+            self.spi
+                .transfer_in_place(&mut buf)
+                .map_err(Error::SpiError)?;
+            let sr2 = buf[1];
+            return self
+                .write_status_registers_internal_blocking(&[Command::WriteStatusRegister as u8, sr1, sr2]);
+        }
+
+        self.write_status_registers_internal_blocking(&[Command::WriteStatusRegister as u8, sr1])
+    }
+
+    fn write_status_registers_internal_blocking(&mut self, payload: &[u8]) -> Result<(), Error<S>> {
+        // If QE (bit 1 of SR2) is being set to 1, datasheet warns:
+        // "WARNING: If /WP or /HOLD pins are tied directly to power supply or
+        // ground, QE should never be set to 1."
+        if payload.len() == 3
+            && (payload[2] & 0x02) != 0
+            && (!HOLD::IS_IMPLEMENTED || !WP::IS_IMPLEMENTED)
+        {
+            return Err(Error::InvalidState);
+        }
+
+        // Ensure /WP is high before /CS falls (tWHSL = 20ns min when SRP0=1, SRP1=0)
+        self.wp.set_high().map_err(|_| Error::PinError)?;
+        self.enable_write_blocking()?;
+
+        self.spi.write(payload).map_err(Error::SpiError)?;
+
+        // Poll BUSY until tw (10ms typ / 15ms max) completes
+        while self.busy_blocking()? {}
+
+        Ok(())
+    }
+}
+
+// Q-Series exclusive commands
+impl<SPI, S: Debug, HOLD, WP> W25<Q, SPI, HOLD, WP>
+where
+    SPI: SpiDevice<Error = S>,
+{
+    /// Read Status Register 2 (0x35, Q-series only, blocking).
+    pub fn read_status_register2_blocking(&mut self) -> Result<u8, Error<S>> {
+        let mut buf: [u8; 2] = [Command::ReadStatusRegister2 as u8, 0];
+
+        self.spi
+            .transfer_in_place(&mut buf)
+            .map_err(Error::SpiError)?;
+
+        Ok(buf[1])
+    }
+
+    /// Checks the Erase/Program Suspend status bit (`SUS`, bit 7 of Status
+    /// Register 2, blocking).
+    pub fn is_suspended_blocking(&mut self) -> Result<bool, Error<S>> {
+        Ok((self.read_status_register2_blocking()? & 0x80) != 0)
+    }
+
+    /// Writes both Status Register 1 and Status Register 2 (0x01, Q-series
+    /// only, blocking).
+    ///
+    /// Returns `Error::InvalidState` if the caller attempts to set the `QE` bit
+    /// (bit 1 of `sr2`) when `HOLD` or `WP` is `NoPin`, preventing a hardware
+    /// bus short-circuit.
+    pub fn write_status_registers_blocking(&mut self, sr1: u8, sr2: u8) -> Result<(), Error<S>>
+    where
+        HOLD: PinCapabilities,
+        WP: PinCapabilities,
+    {
+        self.write_status_registers_internal_blocking(&[Command::WriteStatusRegister as u8, sr1, sr2])
+    }
+
+    /// Suspends an ongoing Sector/Block Erase or Page Program operation (0x75,
+    /// Q-series only, blocking).
+    ///
+    /// Edge cases & Timings:
+    /// * Valid only when `BUSY == 1` and `SUS == 0` (returns
+    ///   `Error::InvalidState` otherwise).
+    /// * Polls until `BUSY` clears to 0 (within `tSUS` <= 20µs), guaranteeing
+    ///   the chip is ready to accept read/program commands immediately upon
+    ///   return.
+    pub fn erase_program_suspend_blocking(&mut self) -> Result<(), Error<S>> {
+        let sr1 = self.read_status_register1_blocking()?;
+        let sr2 = self.read_status_register2_blocking()?;
+
+        // Must be busy (BUSY == 1) and not already suspended (SUS == 0).
+        if (sr1 & 0x01) == 0 || (sr2 & 0x80) != 0 {
+            return Err(Error::InvalidState);
+        }
+
+        self.spi
+            .write(&[Command::EraseSuspend as u8])
+            .map_err(Error::SpiError)?;
+
+        // Wait for BUSY to clear (takes up to tSUS = 20µs).
+        while self.busy_blocking()? {}
+
+        Ok(())
+    }
+
+    /// Resumes a previously suspended Erase or Page Program operation (0x7A,
+    /// Q-series only, blocking).
+    ///
+    /// Edge cases & Timings:
+    /// * Valid only when `SUS == 1` and `BUSY == 0` (returns
+    ///   `Error::InvalidState` otherwise).
+    /// * NOTE: After resuming, a subsequent suspend (`0x75`) must not be issued
+    ///   for at least `tSUS` (20µs).
+    pub fn erase_program_resume_blocking(&mut self) -> Result<(), Error<S>> {
+        let sr1 = self.read_status_register1_blocking()?;
+        let sr2 = self.read_status_register2_blocking()?;
+
+        // Must not be busy (BUSY == 0) and must be suspended (SUS == 1).
+        if (sr1 & 0x01) != 0 || (sr2 & 0x80) == 0 {
+            return Err(Error::InvalidState);
+        }
+
+        self.spi
+            .write(&[Command::EraseResume as u8])
+            .map_err(Error::SpiError)
+    }
+
+    /// Puts the Q-series device into High Performance Mode (0xA3, blocking).
+    ///
+    /// Requires the command byte followed by 3 dummy bytes (24 clock cycles).
+    pub fn enable_high_performance_mode_blocking(&mut self) -> Result<(), Error<S>> {
+        self.spi
+            .write(&[Command::HighPerformanceMode as u8, 0, 0, 0])
+            .map_err(Error::SpiError)
     }
 }

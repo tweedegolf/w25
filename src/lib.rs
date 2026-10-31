@@ -40,6 +40,16 @@ mod hal_common {
         }
     }
 
+    /// Trait indicating whether an `OutputPin` is backed by real hardware pin or `NoPin`.
+    pub trait PinCapabilities: OutputPin {
+        /// True if the pin is physically wired and controllable (`false` for `NoPin`).
+        const IS_IMPLEMENTED: bool = true;
+    }
+
+    impl PinCapabilities for NoPin {
+        const IS_IMPLEMENTED: bool = false;
+    }
+
     impl<S: Debug> NorFlashError for Error<S> {
         fn kind(&self) -> NorFlashErrorKind {
             match self {
@@ -87,7 +97,6 @@ mod hal_common {
 
         /// Set the hold pin state.
         ///
-        /// The driver doesn't do anything with this pin. When using the chip, make sure the hold pin is not asserted.
         /// By default this means the pin needs to be high (true).
         ///
         /// This function sets the pin directly and can cause the chip to not work.
@@ -97,7 +106,6 @@ mod hal_common {
 
         /// Set the write protect pin state.
         ///
-        /// The driver doesn't do anything with this pin. When using the chip, make sure the hold pin is not asserted.
         /// By default this means the pin needs to be high (true).
         ///
         /// This function sets the pin directly and can cause the chip to not work.
@@ -108,7 +116,7 @@ mod hal_common {
 }
 
 #[cfg(any(feature = "blocking", feature = "async"))]
-pub use hal_common::NoPin;
+pub use hal_common::{NoPin, PinCapabilities};
 
 /// The Q series
 pub struct Q;
@@ -121,41 +129,66 @@ pub trait NorSeries {
     const PAGE_SIZE: u32;
     /// The size of a sector in bytes
     const SECTOR_SIZE: u32;
+    /// True if the series has a second status register (SR2) and supports Quad/Suspend features.
+    const HAS_SR2: bool;
 }
 
 impl NorSeries for Q {
     const PAGE_SIZE: u32 = 256;
     const SECTOR_SIZE: u32 = Self::PAGE_SIZE * 16;
+    const HAS_SR2: bool = true;
 }
 
 impl NorSeries for X {
     const PAGE_SIZE: u32 = 256;
     const SECTOR_SIZE: u32 = Self::PAGE_SIZE * 16;
+    const HAS_SR2: bool = false;
 }
 
 /// This trait is implemented when the flash supports the reset commands
 pub trait Reset {}
-
 impl Reset for Q {}
 
 /// Easily readable representation of the command bytes used by the flash chip.
+///
+/// # Warning
+///
+/// It is rather hard to really adapt to global series "Q" or "X" since, even in
+/// a single serie, the commands compatibilities vary. For that reason, the
+/// available commands for your specific model could vary from whats written
+/// below. In this case, since Winbond apparently uses the same instruction set
+/// for its commands, every command is implemented for both series, and it is up
+/// to you to call the ones compatible with your hardware when using the driver.
+/// Also, the X/Q Series are only partially implemented by this driver, things
+/// like Security Registers, and commands that require treating I/O pins
+/// differently from their "standard" modes are not supported (because the
+/// `SpiDevice` trait is not supporting those either).
 #[cfg_attr(not(any(feature = "blocking", feature = "async")), allow(dead_code))]
 #[repr(u8)]
 enum Command {
-    PageProgram = 0x02,
-    ReadData = 0x03,
-    ReadStatusRegister1 = 0x05,
     WriteEnable = 0x06,
+    WriteDisable = 0x04,
+    ReadStatusRegister1 = 0x05,
+    WriteStatusRegister = 0x01,
+    ReadData = 0x03,
+    FastRead = 0x0B,
+    PageProgram = 0x02,
+    Block64Erase = 0xD8,
+    Block32Erase = 0x52,
     SectorErase = 0x20,
+    ChipErase = 0xC7,
+    PowerDown = 0xB9,
+    ReleasePowerDown = 0xAB, // Or Device ID.
+    ManufacturerDeviceId = 0x90,
     JedecId = 0x9F,
     UniqueId = 0x4B,
-    Block32Erase = 0x52,
-    Block64Erase = 0xD8,
-    ChipErase = 0xC7,
-    EnableReset = 0x66,
-    PowerDown = 0xB9,
-    ReleasePowerDown = 0xAB,
-    Reset = 0x99,
+    ReadStatusRegister2 = 0x35, // Q only.
+    EraseSuspend = 0x75,        // Q only.
+    EraseResume = 0x7A,         // Q only.
+    HighPerformanceMode = 0xA3, // Q only.
+    ModeBitReset = 0xFF,        // Q only (0xFFFF for Dual I/O).
+    EnableReset = 0x66,         // Q only.
+    Reset = 0x99,               // Q only.
 }
 
 /// Low level driver for the w25 flash memory chip.
@@ -241,19 +274,24 @@ impl<S: Debug, P: Debug> From<Error<S>> for InitError<S, P> {
 }
 
 /// Custom error type for the various errors that can be thrown by driver.
-/// Can be converted into a NorFlashError.
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum Error<S: Debug> {
     /// Something went wrong with the SPI
     SpiError(S),
+    /// Something went wrong with a control pin.
+    PinError,
     /// An operation was not aligned
     NotAligned,
     /// An operation was out of bounds
     OutOfBounds,
     /// Setting the write enable bit failed for some reason
     WriteEnableFail,
+    /// Attempted to enable Quad Enable (QE) while WP/HOLD are tied to fixed
+    /// rails (NoPin) or attempted to execute a command while the chip is in an
+    /// invalid state (e.g. not busy when suspending).
+    InvalidState,
 }
 
 #[cfg_attr(not(any(feature = "blocking", feature = "async")), allow(dead_code))]
@@ -261,17 +299,32 @@ pub enum Error<S: Debug> {
 fn command_and_address(command: u8, address: u32) -> [u8; 4] {
     [
         command,
-        // MSB, BE
+        // MSB, BE.
         ((address & 0xFF0000) >> 16) as u8,
         ((address & 0x00FF00) >> 8) as u8,
         ((address & 0x0000FF) >> 0) as u8,
     ]
 }
 
+#[cfg_attr(not(any(feature = "blocking", feature = "async")), allow(dead_code))]
+#[allow(clippy::identity_op)]
+fn command_address_dummy(command: u8, address: u32) -> [u8; 5] {
+    [
+        command,
+        // MSB, BE.
+        ((address & 0xFF0000) >> 16) as u8,
+        ((address & 0x00FF00) >> 8) as u8,
+        ((address & 0x0000FF) >> 0) as u8,
+        0x00, // 8 dummy clocks.
+    ]
+}
+
 /// Major byte of the device identification (ID7-ID0) denoting chip capacity.
 ///
-/// Note that the repr value corresponds to the Manufacturer/DeviceID command (0x90) and not the JEDEC ID (0x9F).
-/// The latter is the same value, but incremented by one (with exception of W25_512, which is incremented by seven).
+/// Note that the repr value corresponds to the Manufacturer/DeviceID command
+/// (0x90) and not the JEDEC ID (0x9F). The latter is the same value, but
+/// incremented by one (with exception of W25_512, which is incremented by
+/// seven).
 #[derive(Debug, Clone, Copy, TryFrom)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[repr(u8)]
@@ -343,10 +396,12 @@ impl JedecId {
         self.0[0]
     }
 
-    /// Try to get the major device identifier ID7-0, denoting the chip capacity.
+    /// Try to get the major device identifier ID7-0, denoting the chip
+    /// capacity.
     ///
-    /// If the ID does not match any known device, returns the **original** JEDEC Major Device ID,
-    /// which is incremented by one compared to the value returned by the Manufacturer/DeviceID command (0x90).
+    /// If the ID does not match any known device, returns the **original**
+    /// JEDEC Major Device ID, which is incremented by one compared to the value
+    /// returned by the Manufacturer/DeviceID command (0x90).
     pub fn major_device_id(&self) -> Result<MajorDeviceId, u8> {
         let b_jedec = self.0[2];
         let b_device_id = match b_jedec {
@@ -356,7 +411,8 @@ impl JedecId {
         MajorDeviceId::try_from(b_device_id).map_err(|_e| b_jedec)
     }
 
-    /// Return the minor device identifier ID8-15, denoting the package and variant of the chip.
+    /// Return the minor device identifier ID8-15, denoting the package and
+    /// variant of the chip.
     pub const fn minor_device_id(&self) -> u8 {
         self.0[1]
     }
