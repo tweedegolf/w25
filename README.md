@@ -10,17 +10,26 @@ Supported series:
 
 More series support is welcomed!
 
+This crate provides two APIs, an asynchronous (through the `async` feature,
+enabled by default) and a blocking (through the `blocking` feature) one.
+
 Defmt is also supported through the `defmt` feature.
 
 This crate is adopted from <https://github.com/tweedegolf/w25q32jv>
 
 ## TODO
 
-- Fast read support. So far there's only support for the normal read, so don't use a SPI speed of > 50Mhz
+- _Unreleased_: Fast read support. So far there's only support for the normal
+  read, so don't use a SPI speed of > 50Mhz
 
 ## Changelog
 
 ### Unreleased
+
+- Implements a Blocking API, when the SpiDevice implemented is the blocking
+  version.
+- Implements the 'Fast Read' instruction for both X and Q series that support
+  it.
 
 ### 0.8.0 2026-09-20
 
