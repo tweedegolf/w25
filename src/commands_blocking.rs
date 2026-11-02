@@ -167,7 +167,7 @@ where
 
     /// Read Manufacturer and Device Id (0x90, blocking).
     /// Returns (`manufacturer_id, device_id`).
-    pub async fn manufacturer_device_id_blocking(&mut self) -> Result<(u8, u8), Error<S>> {
+    pub fn manufacturer_device_id_blocking(&mut self) -> Result<(u8, u8), Error<S>> {
         let mut buf: [u8; 6] = [Command::ManufacturerDeviceId as u8, 0, 0, 0, 0, 0];
 
         self.spi
@@ -196,7 +196,7 @@ where
     /// Sending 16 clocks of all 1s (`[0xFF, 0xFF]`) safely resets both Quad I/O
     /// (which needs 8 clocks) and Dual I/O (which needs 16) Continuous Read
     /// Modes accross Q and X series.
-    pub async fn mode_bit_reset_blocking(&mut self) -> Result<(), Error<S>> {
+    pub fn mode_bit_reset_blocking(&mut self) -> Result<(), Error<S>> {
         self.spi
             .write(&[Command::ModeBitReset as u8, Command::ModeBitReset as u8])
             .map_err(Error::SpiError)
@@ -238,7 +238,7 @@ where
     /// # Arguments
     /// * `address` - Address where the first byte of the buf will be read.
     /// * `buf` - Slice that is going to be filled with the read bytes.
-    pub async fn fast_read_blocking(&mut self, address: u32, buf: &mut [u8]) -> Result<(), Error<S>> {
+    pub fn fast_read_blocking(&mut self, address: u32, buf: &mut [u8]) -> Result<(), Error<S>> {
         self.check_read(address, buf.len())?;
 
         if buf.is_empty() {
@@ -476,7 +476,7 @@ where
     ///
     /// NOTE: When reading the Electric Signature, the chip requires `tRES2`
     /// (max 1.8µs) after `/CS` rises to resume normal standby operation.
-    pub async fn release_power_down_and_device_id_blocking(&mut self) -> Result<u8, Error<S>> {
+    pub fn release_power_down_and_device_id_blocking(&mut self) -> Result<u8, Error<S>> {
         let mut buf: [u8; 5] = [Command::ReleasePowerDown as u8, 0, 0, 0, 0];
 
         self.spi
@@ -511,8 +511,11 @@ where
                 .transfer_in_place(&mut buf)
                 .map_err(Error::SpiError)?;
             let sr2 = buf[1];
-            return self
-                .write_status_registers_internal_blocking(&[Command::WriteStatusRegister as u8, sr1, sr2]);
+            return self.write_status_registers_internal_blocking(&[
+                Command::WriteStatusRegister as u8,
+                sr1,
+                sr2,
+            ]);
         }
 
         self.write_status_registers_internal_blocking(&[Command::WriteStatusRegister as u8, sr1])
@@ -575,7 +578,11 @@ where
         HOLD: PinCapabilities,
         WP: PinCapabilities,
     {
-        self.write_status_registers_internal_blocking(&[Command::WriteStatusRegister as u8, sr1, sr2])
+        self.write_status_registers_internal_blocking(&[
+            Command::WriteStatusRegister as u8,
+            sr1,
+            sr2,
+        ])
     }
 
     /// Suspends an ongoing Sector/Block Erase or Page Program operation (0x75,
