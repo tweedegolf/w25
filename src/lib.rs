@@ -40,16 +40,6 @@ mod hal_common {
         }
     }
 
-    /// Trait indicating whether an `OutputPin` is backed by real hardware pin or `NoPin`.
-    pub trait PinCapabilities: OutputPin {
-        /// True if the pin is physically wired and controllable (`false` for `NoPin`).
-        const IS_IMPLEMENTED: bool = true;
-    }
-
-    impl PinCapabilities for NoPin {
-        const IS_IMPLEMENTED: bool = false;
-    }
-
     impl<S: Debug> NorFlashError for Error<S> {
         fn kind(&self) -> NorFlashErrorKind {
             match self {
@@ -97,6 +87,8 @@ mod hal_common {
 
         /// Set the hold pin state.
         ///
+        /// The driver doesn't do anything with this pin. When using the chip, make
+        /// sure the hold pin is not asserted.
         /// By default this means the pin needs to be high (true).
         ///
         /// This function sets the pin directly and can cause the chip to not work.
@@ -106,6 +98,8 @@ mod hal_common {
 
         /// Set the write protect pin state.
         ///
+        /// The driver doesn't do anything with this pin. When using the chip, make
+        /// sure the hold pin is not asserted.
         /// By default this means the pin needs to be high (true).
         ///
         /// This function sets the pin directly and can cause the chip to not work.
@@ -116,7 +110,7 @@ mod hal_common {
 }
 
 #[cfg(any(feature = "blocking", feature = "async"))]
-pub use hal_common::{NoPin, PinCapabilities};
+pub use hal_common::NoPin;
 
 /// The Q series
 pub struct Q;
@@ -167,9 +161,7 @@ impl Reset for Q {}
 #[repr(u8)]
 enum Command {
     WriteEnable = 0x06,
-    WriteDisable = 0x04,
     ReadStatusRegister1 = 0x05,
-    WriteStatusRegister = 0x01,
     ReadData = 0x03,
     FastRead = 0x0B,
     PageProgram = 0x02,

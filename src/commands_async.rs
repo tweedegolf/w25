@@ -111,7 +111,7 @@ where
     SPI: SpiDevice<Error = S>,
 {
     /// Read Status Register 1 (0x05).
-    pub async fn read_status_register1(&mut self) -> Result<u8, Error<S>> {
+    async fn read_status_register1(&mut self) -> Result<u8, Error<S>> {
         let mut buf: [u8; 2] = [Command::ReadStatusRegister1 as u8; 2];
 
         self.spi
@@ -126,21 +126,12 @@ where
     /// working on a previous one. Especially erases take a long time.
     /// This function returns true while the chip is unable to respond to
     /// commands (with the exception of the busy command).
-    pub(crate) async fn busy(&mut self) -> Result<bool, Error<S>> {
+    async fn busy(&mut self) -> Result<bool, Error<S>> {
         Ok((self.read_status_register1().await? & 0x01) != 0)
     }
 
     async fn write_enabled(&mut self) -> Result<bool, Error<S>> {
         Ok((self.read_status_register1().await? & 0x02) != 0)
-    }
-
-    /// Explicitely resets the Write Enable Latch (WEL) bit in Status Register 1
-    /// to 0 (0x04).
-    pub async fn disable_write(&mut self) -> Result<(), Error<S>> {
-        self.spi
-            .write(&[Command::WriteDisable as u8])
-            .await
-            .map_err(Error::SpiError)
     }
 
     /// Request the 64 bit id that is unique to this chip (0x4B).
@@ -527,73 +518,13 @@ where
     }
 }
 
-// Commands that interact with Write Protect (/WP) or Status Register 1 & 2
-// writing.
-impl<Series: NorSeries, SPI, S: Debug, HOLD, WP> W25<Series, SPI, HOLD, WP>
-where
-    SPI: SpiDevice<Error = S>,
-    HOLD: PinCapabilities,
-    WP: PinCapabilities,
-{
-    /// Writes Status Register 1 (0x01) on X-series, or preserves SR2 on
-    /// Q-series.
-    ///
-    /// Handles hardware `/WP` unprotection automatically if `WP` is a connected
-    /// pin, and prevents writing 1-byte on Q-series chips (which would
-    /// accidentally clear `CMP` and `QE` in SR2).
-    pub async fn write_status_register1(&mut self, sr1: u8) -> Result<(), Error<S>> {
-        if Series::HAS_SR2 {
-            // On Q-series, clocking only 8 bits into 0x01 clears CMP and QE in
-            // SR2 to 0! Read SR2 first so we can write all 16 bits and
-            // preserve SR2.
-            let mut buf = [Command::ReadStatusRegister2 as u8, 0];
-            self.spi
-                .transfer_in_place(&mut buf)
-                .await
-                .map_err(Error::SpiError)?;
-            let sr2 = buf[1];
-            return self
-                .write_status_registers_internal(&[Command::WriteStatusRegister as u8, sr1, sr2])
-                .await;
-        }
-
-        self.write_status_registers_internal(&[Command::WriteStatusRegister as u8, sr1])
-            .await
-    }
-
-    async fn write_status_registers_internal(&mut self, payload: &[u8]) -> Result<(), Error<S>> {
-        // If QE (bit 1 of SR2) is being set to 1, datasheet warns:
-        // "WARNING: If /WP or /HOLD pins are tied directly to power supply or
-        // ground, QE should never be set to 1."
-        if payload.len() == 3
-            && (payload[2] & 0x02) != 0
-            && (!HOLD::IS_IMPLEMENTED || !WP::IS_IMPLEMENTED)
-        {
-            return Err(Error::InvalidState);
-        }
-
-        // Ensure /WP is high before /CS falls (tWHSL = 20ns min when SRP0=1, SRP1=0)
-        self.wp.set_high().map_err(|_| Error::PinError)?;
-        self.enable_write().await?;
-
-        self.spi.write(payload).await.map_err(Error::SpiError)?;
-
-        // Poll BUSY until tw (10ms typ / 15ms max) completes
-        while self.busy().await? {
-            yield_now().await;
-        }
-
-        Ok(())
-    }
-}
-
 // Q-Series exclusive commands
 impl<SPI, S: Debug, HOLD, WP> W25<Q, SPI, HOLD, WP>
 where
     SPI: SpiDevice<Error = S>,
 {
     /// Read Status Register 2 (0x35, Q-series only).
-    pub async fn read_status_register2(&mut self) -> Result<u8, Error<S>> {
+    async fn read_status_register2(&mut self) -> Result<u8, Error<S>> {
         let mut buf: [u8; 2] = [Command::ReadStatusRegister2 as u8, 0];
 
         self.spi
@@ -608,21 +539,6 @@ where
     /// Register 2).
     pub async fn is_suspended(&mut self) -> Result<bool, Error<S>> {
         Ok((self.read_status_register2().await? & 0x80) != 0)
-    }
-
-    /// Writes both Status Register 1 and Status Register 2 (0x01, Q-series
-    /// only).
-    ///
-    /// Returns `Error::InvalidState` if the caller attempts to set the `QE` bit
-    /// (bit 1 of `sr2`) when `HOLD` or `WP` is `NoPin`, preventing a hardware
-    /// bus short-circuit.
-    pub async fn write_status_registers(&mut self, sr1: u8, sr2: u8) -> Result<(), Error<S>>
-    where
-        HOLD: PinCapabilities,
-        WP: PinCapabilities,
-    {
-        self.write_status_registers_internal(&[Command::WriteStatusRegister as u8, sr1, sr2])
-            .await
     }
 
     /// Suspends an ongoing Sector/Block Erase or Page Program operation (0x75,
