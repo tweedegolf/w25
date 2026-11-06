@@ -5,12 +5,112 @@
 
 use core::{fmt::Debug, marker::PhantomData};
 use derive_more::TryFrom;
-use embassy_futures::yield_now;
-use embedded_hal::digital::{OutputPin, PinState};
-use embedded_hal_async::spi::SpiDevice;
-use embedded_storage::nor_flash::{ErrorType, NorFlashError, NorFlashErrorKind};
 
-mod commands_impl;
+#[cfg(feature = "async")]
+mod commands_async;
+
+#[cfg(feature = "blocking")]
+mod commands_blocking;
+
+#[cfg(any(feature = "blocking", feature = "async"))]
+mod hal_common {
+    use super::*;
+    use core::convert::Infallible;
+    use embedded_hal::digital::{ErrorType as PinErrorType, OutputPin, PinState};
+    use embedded_storage::nor_flash::{
+        ErrorType as StorageErrorType, NorFlashError, NorFlashErrorKind,
+    };
+
+    /// Dummy pin implementation when HOLD or WP pins are not connected to the MCU.
+    pub struct NoPin {}
+
+    impl PinErrorType for NoPin {
+        type Error = Infallible;
+    }
+
+    impl OutputPin for NoPin {
+        fn set_low(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn set_high(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn set_state(&mut self, _state: PinState) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    impl<S: Debug> NorFlashError for Error<S> {
+        fn kind(&self) -> NorFlashErrorKind {
+            match self {
+                Error::NotAligned => NorFlashErrorKind::NotAligned,
+                Error::OutOfBounds => NorFlashErrorKind::OutOfBounds,
+                _ => NorFlashErrorKind::Other,
+            }
+        }
+    }
+
+    impl<Series: NorSeries, SPI, S: Debug, HOLD, WP> StorageErrorType for W25<Series, SPI, HOLD, WP>
+    where
+        SPI: embedded_hal::spi::ErrorType<Error = S>,
+    {
+        type Error = Error<S>;
+    }
+
+    impl<Series: NorSeries, SPI, S: Debug, P: Debug, HOLD, WP> W25<Series, SPI, HOLD, WP>
+    where
+        SPI: embedded_hal::spi::ErrorType<Error = S>,
+        HOLD: OutputPin<Error = P>,
+        WP: OutputPin<Error = P>,
+    {
+        /// Internal constructor for initializing the W25 flash driver.
+        ///
+        /// Configures the `HOLD` and `WP` control pins to a high state
+        /// (inactive/deselected) and wraps the provided SPI peripheral, pins,
+        /// and memory capacity into the driver instance.
+        pub(crate) fn _new(
+            spi: SPI,
+            mut hold: HOLD,
+            mut wp: WP,
+            capacity: u32,
+        ) -> Result<Self, InitError<S, P>> {
+            hold.set_high().map_err(InitError::PinError)?;
+            wp.set_high().map_err(InitError::PinError)?;
+            Ok(Self {
+                spi,
+                hold,
+                wp,
+                capacity,
+                _phantom: PhantomData,
+            })
+        }
+
+        /// Set the hold pin state.
+        ///
+        /// The driver doesn't do anything with this pin. When using the chip, make
+        /// sure the hold pin is not asserted.
+        /// By default this means the pin needs to be high (true).
+        ///
+        /// This function sets the pin directly and can cause the chip to not work.
+        pub fn set_hold(&mut self, value: PinState) -> Result<(), P> {
+            self.hold.set_state(value)
+        }
+
+        /// Set the write protect pin state.
+        ///
+        /// The driver doesn't do anything with this pin. When using the chip, make
+        /// sure the hold pin is not asserted.
+        /// By default this means the pin needs to be high (true).
+        ///
+        /// This function sets the pin directly and can cause the chip to not work.
+        pub fn set_wp(&mut self, value: PinState) -> Result<(), P> {
+            self.wp.set_state(value)
+        }
+    }
+}
+
+#[cfg(any(feature = "blocking", feature = "async"))]
+pub use hal_common::NoPin;
 
 /// The Q series
 pub struct Q;
@@ -23,150 +123,124 @@ pub trait NorSeries {
     const PAGE_SIZE: u32;
     /// The size of a sector in bytes
     const SECTOR_SIZE: u32;
+    /// True if the series has a second status register (SR2) and supports Quad/Suspend features.
+    const HAS_SR2: bool;
 }
 
 impl NorSeries for Q {
     const PAGE_SIZE: u32 = 256;
     const SECTOR_SIZE: u32 = Self::PAGE_SIZE * 16;
+    const HAS_SR2: bool = true;
 }
 
 impl NorSeries for X {
     const PAGE_SIZE: u32 = 256;
     const SECTOR_SIZE: u32 = Self::PAGE_SIZE * 16;
+    const HAS_SR2: bool = false;
 }
 
 /// This trait is implemented when the flash supports the reset commands
 pub trait Reset {}
-
 impl Reset for Q {}
 
 /// Easily readable representation of the command bytes used by the flash chip.
+///
+/// # Warning
+///
+/// It is rather hard to really adapt to global series "Q" or "X" since, even in
+/// a single serie, the commands compatibilities vary. For that reason, the
+/// available commands for your specific model could vary from whats written
+/// below. In this case, since Winbond apparently uses the same instruction set
+/// for its commands, every command is implemented for both series, and it is up
+/// to you to call the ones compatible with your hardware when using the driver.
+/// Also, the X/Q Series are only partially implemented by this driver, things
+/// like Security Registers, and commands that require treating I/O pins
+/// differently from their "standard" modes are not supported (because the
+/// `SpiDevice` trait is not supporting those either).
+#[cfg_attr(not(any(feature = "blocking", feature = "async")), allow(dead_code))]
 #[repr(u8)]
 enum Command {
-    PageProgram = 0x02,
-    ReadData = 0x03,
-    ReadStatusRegister1 = 0x05,
     WriteEnable = 0x06,
+    ReadStatusRegister1 = 0x05,
+    ReadData = 0x03,
+    FastRead = 0x0B,
+    PageProgram = 0x02,
+    Block64Erase = 0xD8,
+    Block32Erase = 0x52,
     SectorErase = 0x20,
+    ChipErase = 0xC7,
+    PowerDown = 0xB9,
+    ReleasePowerDown = 0xAB, // Or Device ID.
+    ManufacturerDeviceId = 0x90,
     JedecId = 0x9F,
     UniqueId = 0x4B,
-    Block32Erase = 0x52,
-    Block64Erase = 0xD8,
-    ChipErase = 0xC7,
-    EnableReset = 0x66,
-    PowerDown = 0xB9,
-    ReleasePowerDown = 0xAB,
-    Reset = 0x99,
+    ReadStatusRegister2 = 0x35, // Q only.
+    EraseSuspend = 0x75,        // Q only.
+    EraseResume = 0x7A,         // Q only.
+    HighPerformanceMode = 0xA3, // Q only.
+    ModeBitReset = 0xFF,        // Q only (0xFFFF for Dual I/O).
+    EnableReset = 0x66,         // Q only.
+    Reset = 0x99,               // Q only.
 }
 
 /// Low level driver for the w25 flash memory chip.
+#[cfg_attr(not(any(feature = "blocking", feature = "async")), allow(dead_code))]
 pub struct W25<Series, SPI, HOLD, WP> {
-    spi: SPI,
-    hold: HOLD,
-    wp: WP,
-    capacity: u32,
-    _pantom: PhantomData<Series>,
+    pub(crate) spi: SPI,
+    pub(crate) hold: HOLD,
+    pub(crate) wp: WP,
+    pub(crate) capacity: u32,
+    _phantom: PhantomData<Series>,
 }
 
+#[cfg_attr(not(any(feature = "blocking", feature = "async")), allow(dead_code))]
 impl<Series: NorSeries, SPI, HOLD, WP> W25<Series, SPI, HOLD, WP> {
     /// Get the total capacity of the flash in bytes
     pub fn capacity(&self) -> u32 {
         self.capacity
     }
 
-    fn n_sectors(&self) -> u32 {
+    pub(crate) fn n_sectors(&self) -> u32 {
         self.capacity / Series::SECTOR_SIZE
     }
 
-    fn n_blocks_32k(&self) -> u32 {
+    pub(crate) fn n_blocks_32k(&self) -> u32 {
         self.capacity / 32768
     }
 
-    fn n_blocks_64k(&self) -> u32 {
+    pub(crate) fn n_blocks_64k(&self) -> u32 {
         self.capacity / 65536
     }
-}
 
-impl<Series: NorSeries, SPI, S: Debug, P: Debug, HOLD, WP> W25<Series, SPI, HOLD, WP>
-where
-    SPI: embedded_hal::spi::ErrorType<Error = S> + embedded_hal_async::spi::SpiDevice,
-    HOLD: OutputPin<Error = P>,
-    WP: OutputPin<Error = P>,
-{
-    /// Create a new instance of the flash.
-    ///
-    /// The capacity must be the total chip capacity in bytes.
-    /// Weird things can happen if you provide the wrong value.
-    /// No checks are done, you're believed at your word.
-    pub async fn new(spi: SPI, hold: HOLD, wp: WP, capacity: u32) -> Result<Self, InitError<S, P>> {
-        let mut flash = W25 {
-            spi,
-            hold,
-            wp,
-            capacity,
-            _pantom: PhantomData,
-        };
-
-        flash.hold.set_high().map_err(InitError::PinError)?;
-        flash.wp.set_high().map_err(InitError::PinError)?;
-
-        // Ensure the device is not busy from before a MCU restart
-        while flash.busy().await? {
-            // Avoid starving the executor when the SPI is
-            // fast enough for the busy check to not yield
-            yield_now().await;
+    #[inline]
+    pub(crate) fn check_read<S: Debug>(&self, offset: u32, len: usize) -> Result<(), Error<S>> {
+        if offset.saturating_add(len as u32) > self.capacity {
+            Err(Error::OutOfBounds)
+        } else {
+            Ok(())
         }
-
-        Ok(flash)
     }
 
-    /// Set the hold pin state.
-    ///
-    /// The driver doesn't do anything with this pin. When using the chip, make sure the hold pin is not asserted.
-    /// By default this means the pin needs to be high (true).
-    ///
-    /// This function sets the pin directly and can cause the chip to not work.
-    pub fn set_hold(&mut self, value: PinState) -> Result<(), P> {
-        self.hold.set_state(value)
-    }
-
-    /// Set the write protect pin state.
-    ///
-    /// The driver doesn't do anything with this pin. When using the chip, make sure the hold pin is not asserted.
-    /// By default this means the pin needs to be high (true).
-    ///
-    /// This function sets the pin directly and can cause the chip to not work.
-    pub fn set_wp(&mut self, value: PinState) -> Result<(), P> {
-        self.wp.set_state(value)
-    }
-}
-
-impl<Series: NorSeries, SPI, S: Debug> W25<Series, SPI, (), ()>
-where
-    SPI: embedded_hal::spi::ErrorType<Error = S> + embedded_hal_async::spi::SpiDevice,
-{
-    /// Create a new instance of the flash, but without the nHold and nWP pins.
-    ///
-    /// The capacity must be the total chip capacity.
-    /// Weird things can happen if you provide the wrong value.
-    /// No checks are done, you're believed at your word.
-    pub async fn new_no_pins(spi: SPI, capacity: u32) -> Result<Self, Error<S>> {
-        let mut flash = Self {
-            spi,
-            hold: (),
-            wp: (),
-            capacity,
-            _pantom: PhantomData,
-        };
-
-        // Ensure the device is not busy from before a MCU restart
-        while flash.busy().await? {
-            // Avoid starving the executor when the SPI is
-            // fast enough for the busy check to not yield
-            yield_now().await;
+    #[inline]
+    pub(crate) fn check_write<S: Debug>(&self, offset: u32, len: usize) -> Result<(), Error<S>> {
+        if offset.saturating_add(len as u32) > self.capacity {
+            Err(Error::OutOfBounds)
+        } else {
+            Ok(())
         }
+    }
 
-        Ok(flash)
+    #[inline]
+    pub(crate) fn check_erase<S: Debug>(&self, from: u32, to: u32) -> Result<(), Error<S>> {
+        if from > to || to > self.capacity {
+            Err(Error::OutOfBounds)
+        } else if !from.is_multiple_of(Series::SECTOR_SIZE)
+            || !to.is_multiple_of(Series::SECTOR_SIZE)
+        {
+            Err(Error::NotAligned)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -191,97 +265,58 @@ impl<S: Debug, P: Debug> From<Error<S>> for InitError<S, P> {
     }
 }
 
-impl<Series: NorSeries, SPI, S: Debug, P: Debug, HOLD, WP> W25<Series, SPI, HOLD, WP>
-where
-    SPI: SpiDevice<Error = S>,
-    HOLD: OutputPin<Error = P>,
-    WP: OutputPin<Error = P>,
-{
-    /// Create a new instance of the flash, autodetecting the chip variant and capacity.
-    pub async fn new_autodetect(spi: SPI, hold: HOLD, wp: WP) -> Result<Self, InitError<S, P>> {
-        let mut flash = W25 {
-            spi,
-            hold,
-            wp,
-            capacity: 0, // For now do not set the capacity of the device, as we do not know yet.
-            _pantom: PhantomData,
-        };
-
-        flash.hold.set_high().map_err(InitError::PinError)?;
-        flash.wp.set_high().map_err(InitError::PinError)?;
-
-        let jedec_id = flash.jedec_id().await?;
-        let manufacturer = jedec_id.manufacturer();
-        if jedec_id.manufacturer() != JedecId::MANUFACTURER {
-            return Err(InitError::ManufacturerNotRecognized(manufacturer));
-        }
-
-        let major_device_id = jedec_id
-            .major_device_id()
-            .map_err(InitError::DeviceNotRecognized)?;
-
-        // Update the capacity.
-        flash.capacity = major_device_id.capacity();
-
-        // Ensure the device is not busy from before a MCU restart
-        while flash.busy().await? {
-            // Avoid starving the executor when the SPI is
-            // fast enough for the busy check to not yield
-            yield_now().await;
-        }
-
-        Ok(flash)
-    }
-}
-
-impl<Series: NorSeries, SPI, S: Debug, HOLD, WP> ErrorType for W25<Series, SPI, HOLD, WP>
-where
-    SPI: embedded_hal::spi::ErrorType<Error = S>,
-{
-    type Error = Error<S>;
-}
-
 /// Custom error type for the various errors that can be thrown by driver.
-/// Can be converted into a NorFlashError.
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum Error<S: Debug> {
     /// Something went wrong with the SPI
     SpiError(S),
+    /// Something went wrong with a control pin.
+    PinError,
     /// An operation was not aligned
     NotAligned,
     /// An operation was out of bounds
     OutOfBounds,
     /// Setting the write enable bit failed for some reason
     WriteEnableFail,
+    /// Attempted to enable Quad Enable (QE) while WP/HOLD are tied to fixed
+    /// rails (NoPin) or attempted to execute a command while the chip is in an
+    /// invalid state (e.g. not busy when suspending).
+    InvalidState,
 }
 
-impl<S: Debug> NorFlashError for Error<S> {
-    fn kind(&self) -> NorFlashErrorKind {
-        match self {
-            Error::NotAligned => NorFlashErrorKind::NotAligned,
-            Error::OutOfBounds => NorFlashErrorKind::OutOfBounds,
-            _ => NorFlashErrorKind::Other,
-        }
-    }
-}
-
+#[cfg_attr(not(any(feature = "blocking", feature = "async")), allow(dead_code))]
 #[allow(clippy::identity_op)]
 fn command_and_address(command: u8, address: u32) -> [u8; 4] {
     [
         command,
-        // MSB, BE
+        // MSB, BE.
         ((address & 0xFF0000) >> 16) as u8,
         ((address & 0x00FF00) >> 8) as u8,
         ((address & 0x0000FF) >> 0) as u8,
     ]
 }
 
+#[cfg_attr(not(any(feature = "blocking", feature = "async")), allow(dead_code))]
+#[allow(clippy::identity_op)]
+fn command_address_dummy(command: u8, address: u32) -> [u8; 5] {
+    [
+        command,
+        // MSB, BE.
+        ((address & 0xFF0000) >> 16) as u8,
+        ((address & 0x00FF00) >> 8) as u8,
+        ((address & 0x0000FF) >> 0) as u8,
+        0x00, // 8 dummy clocks.
+    ]
+}
+
 /// Major byte of the device identification (ID7-ID0) denoting chip capacity.
 ///
-/// Note that the repr value corresponds to the Manufacturer/DeviceID command (0x90) and not the JEDEC ID (0x9F).
-/// The latter is the same value, but incremented by one (with exception of W25_512, which is incremented by seven).
+/// Note that the repr value corresponds to the Manufacturer/DeviceID command
+/// (0x90) and not the JEDEC ID (0x9F). The latter is the same value, but
+/// incremented by one (with exception of W25_512, which is incremented by
+/// seven).
 #[derive(Debug, Clone, Copy, TryFrom)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[repr(u8)]
@@ -339,7 +374,7 @@ impl MajorDeviceId {
     }
 }
 
-/// Result from the
+/// Result from the JEDEC ID (0x9F) command.
 pub struct JedecId([u8; 3]);
 
 impl JedecId {
@@ -353,10 +388,12 @@ impl JedecId {
         self.0[0]
     }
 
-    /// Try to get the major device identifier ID7-0, denoting the chip capacity.
+    /// Try to get the major device identifier ID7-0, denoting the chip
+    /// capacity.
     ///
-    /// If the ID does not match any known device, returns the **original** JEDEC Major Device ID,
-    /// which is incremented by one compared to the value returned by the Manufacturer/DeviceID command (0x90).
+    /// If the ID does not match any known device, returns the **original**
+    /// JEDEC Major Device ID, which is incremented by one compared to the value
+    /// returned by the Manufacturer/DeviceID command (0x90).
     pub fn major_device_id(&self) -> Result<MajorDeviceId, u8> {
         let b_jedec = self.0[2];
         let b_device_id = match b_jedec {
@@ -366,7 +403,8 @@ impl JedecId {
         MajorDeviceId::try_from(b_device_id).map_err(|_e| b_jedec)
     }
 
-    /// Return the minor device identifier ID8-15, denoting the package and variant of the chip.
+    /// Return the minor device identifier ID8-15, denoting the package and
+    /// variant of the chip.
     pub const fn minor_device_id(&self) -> u8 {
         self.0[1]
     }
