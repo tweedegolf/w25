@@ -64,6 +64,11 @@ where
             yield_now().await;
         }
 
+        // Automatically select address mode when capacity is known.
+        if flash.capacity > 0x0100_0000 {
+            flash.enter_4byte_address_mode().await?;
+        }
+
         Ok(flash)
     }
 
@@ -82,7 +87,40 @@ where
             .map_err(InitError::DeviceNotRecognized)?;
         flash.capacity = major_id.capacity();
 
+        // This is important for W25(q/x)256 or higher 
+        if flash.capacity > 0x0100_0000 {
+            flash.enter_4byte_address_mode().await?;
+        }
+
         Ok(flash)
+    }
+
+    /// Enter four-byte address mode (0xB7).
+    pub async fn enter_4byte_address_mode(
+        &mut self,
+    ) -> Result<(), Error<S>> {
+        self.spi
+            .write(&[Command::Enter4ByteAddressMode as u8])
+            .await
+            .map_err(Error::SpiError)?;
+
+        self.address_mode = AddressMode::FourByte;
+
+        Ok(())
+    }
+
+    /// Exit four-byte address mode (0xE9).
+    pub async fn exit_4byte_address_mode(
+        &mut self,
+    ) -> Result<(), Error<S>> {
+        self.spi
+            .write(&[Command::Exit4ByteAddressMode as u8])
+            .await
+            .map_err(Error::SpiError)?;
+
+        self.address_mode = AddressMode::ThreeByte;
+
+        Ok(())
     }
 }
 
@@ -186,7 +224,16 @@ where
         self.spi
             .write(&[Command::Reset as u8])
             .await
-            .map_err(Error::SpiError)
+            .map_err(Error::SpiError)?;
+
+        // The chip's reset returns its volatile configuration to its reset defaults, including its address mode.
+        // Therefore, simply retaining self.address_mode == FourByte after a reset would be incorrect.
+        // Restore the previously selected mode.
+        if self.capacity > 0x0100_0000 {
+            self.enter_4byte_address_mode().await?;
+        }
+
+        Ok(())
     }
 
     /// Reset Continuous Read Mode (0xFFFF) to return the device to normal SPI
@@ -218,9 +265,15 @@ where
             return Ok(());
         }
 
+        let (header, header_len) = command_and_address_mode(
+            Command::ReadData as u8,
+            address,
+            self.address_mode,
+        );
+
         self.spi
             .transaction(&mut [
-                Operation::Write(&command_and_address(Command::ReadData as u8, address)),
+                Operation::Write(&header[..header_len]),
                 Operation::Read(buf),
             ])
             .await
@@ -245,9 +298,15 @@ where
             return Ok(());
         }
 
+        let (header, header_len) = command_address_dummy_mode(
+            Command::FastRead as u8,
+            address,
+            self.address_mode,
+        );
+
         self.spi
             .transaction(&mut [
-                Operation::Write(&command_address_dummy(Command::FastRead as u8, address)),
+                Operation::Write(&header[..header_len]),
                 Operation::Read(buf),
             ])
             .await
@@ -313,9 +372,15 @@ where
 
         self.enable_write().await?;
 
+        let (header, header_len) = command_and_address_mode(
+            Command::PageProgram as u8,
+            address,
+            self.address_mode,
+        );
+
         self.spi
             .transaction(&mut [
-                Operation::Write(&command_and_address(Command::PageProgram as u8, address)),
+                Operation::Write(&header[..header_len]),
                 Operation::Write(buf),
             ])
             .await
@@ -375,8 +440,14 @@ where
 
         let address: u32 = index * Series::SECTOR_SIZE;
 
+        let (header, header_len) = command_and_address_mode(
+            Command::SectorErase as u8,
+            address,
+            self.address_mode,
+        );
+
         self.spi
-            .write(&command_and_address(Command::SectorErase as u8, address))
+            .write(&header[..header_len])
             .await
             .map_err(Error::SpiError)?;
 
@@ -404,8 +475,14 @@ where
 
         let address: u32 = index * 32768;
 
+        let (header, header_len) = command_and_address_mode(
+            Command::Block32Erase as u8,
+            address,
+            self.address_mode,
+        );
+
         self.spi
-            .write(&command_and_address(Command::Block32Erase as u8, address))
+            .write(&header[..header_len])
             .await
             .map_err(Error::SpiError)?;
 
@@ -433,8 +510,14 @@ where
 
         let address: u32 = index * 65536;
 
+        let (header, header_len) = command_and_address_mode(
+            Command::Block64Erase as u8,
+            address,
+            self.address_mode,
+        );
+
         self.spi
-            .write(&command_and_address(Command::Block64Erase as u8, address))
+            .write(&header[..header_len])
             .await
             .map_err(Error::SpiError)?;
 

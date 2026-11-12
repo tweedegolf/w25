@@ -81,6 +81,7 @@ mod hal_common {
                 hold,
                 wp,
                 capacity,
+                address_mode: AddressMode::ThreeByte,
                 _phantom: PhantomData,
             })
         }
@@ -125,6 +126,16 @@ pub trait NorSeries {
     const SECTOR_SIZE: u32;
     /// True if the series has a second status register (SR2) and supports Quad/Suspend features.
     const HAS_SR2: bool;
+}
+
+/// Addressing mode used by the flash driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressMode {
+    /// Traditional 24-bit addressing. For w25(q/x)128 or smaller
+    ThreeByte,
+
+    /// 32-bit addressing. For w25(q/x)256 or bigger up to 
+    FourByte, 
 }
 
 impl NorSeries for Q {
@@ -181,6 +192,8 @@ enum Command {
     ModeBitReset = 0xFF,        // Q only (0xFFFF for Dual I/O).
     EnableReset = 0x66,         // Q only.
     Reset = 0x99,               // Q only.
+    Enter4ByteAddressMode = 0xB7,
+    Exit4ByteAddressMode = 0xE9,
 }
 
 /// Low level driver for the w25 flash memory chip.
@@ -190,6 +203,7 @@ pub struct W25<Series, SPI, HOLD, WP> {
     pub(crate) hold: HOLD,
     pub(crate) wp: WP,
     pub(crate) capacity: u32,
+    pub(crate) address_mode: AddressMode,
     _phantom: PhantomData<Series>,
 }
 
@@ -309,6 +323,78 @@ fn command_address_dummy(command: u8, address: u32) -> [u8; 5] {
         ((address & 0x0000FF) >> 0) as u8,
         0x00, // 8 dummy clocks.
     ]
+}
+
+/// Build a command header using the selected address mode.
+///
+/// Returns the header and its actual length.
+pub(crate) fn command_and_address_mode(
+    command: u8,
+    address: u32,
+    mode: AddressMode,
+) -> ([u8; 5], usize) {
+    let bytes = address.to_be_bytes();
+
+    match mode {
+        AddressMode::ThreeByte => (
+            [
+                command,
+                bytes[1],
+                bytes[2],
+                bytes[3],
+                0,
+            ],
+            4,
+        ),
+
+        AddressMode::FourByte => (
+            [
+                command,
+                bytes[0],
+                bytes[1],
+                bytes[2],
+                bytes[3],
+            ],
+            5,
+        ),
+    }
+}
+
+/// Build a fast-read command header using the selected address mode.
+///
+/// Returns the header and its actual length.
+pub(crate) fn command_address_dummy_mode(
+    command: u8,
+    address: u32,
+    mode: AddressMode,
+) -> ([u8; 6], usize) {
+    let bytes = address.to_be_bytes();
+
+    match mode {
+        AddressMode::ThreeByte => (
+            [
+                command,
+                bytes[1],
+                bytes[2],
+                bytes[3],
+                0x00, // 8 dummy clocks
+                0,
+            ],
+            5,
+        ),
+
+        AddressMode::FourByte => (
+            [
+                command,
+                bytes[0],
+                bytes[1],
+                bytes[2],
+                bytes[3],
+                0x00, // 8 dummy clocks
+            ],
+            6,
+        ),
+    }
 }
 
 /// Major byte of the device identification (ID7-ID0) denoting chip capacity.
