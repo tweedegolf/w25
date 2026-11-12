@@ -87,40 +87,12 @@ where
             .map_err(InitError::DeviceNotRecognized)?;
         flash.capacity = major_id.capacity();
 
-        // This is important for W25(q/x)256 or higher 
+        // This is important for W25(q/x)256 or higher
         if flash.capacity > 0x0100_0000 {
             flash.enter_4byte_address_mode().await?;
         }
 
         Ok(flash)
-    }
-
-    /// Enter four-byte address mode (0xB7).
-    pub async fn enter_4byte_address_mode(
-        &mut self,
-    ) -> Result<(), Error<S>> {
-        self.spi
-            .write(&[Command::Enter4ByteAddressMode as u8])
-            .await
-            .map_err(Error::SpiError)?;
-
-        self.address_mode = AddressMode::FourByte;
-
-        Ok(())
-    }
-
-    /// Exit four-byte address mode (0xE9).
-    pub async fn exit_4byte_address_mode(
-        &mut self,
-    ) -> Result<(), Error<S>> {
-        self.spi
-            .write(&[Command::Exit4ByteAddressMode as u8])
-            .await
-            .map_err(Error::SpiError)?;
-
-        self.address_mode = AddressMode::ThreeByte;
-
-        Ok(())
     }
 }
 
@@ -212,6 +184,30 @@ where
         Ok((buf[4], buf[5]))
     }
 
+    /// Enter four-byte address mode (0xB7).
+    pub async fn enter_4byte_address_mode(&mut self) -> Result<(), Error<S>> {
+        self.spi
+            .write(&[Command::Enter4ByteAddressMode as u8])
+            .await
+            .map_err(Error::SpiError)?;
+
+        self.address_mode = AddressMode::FourByte;
+
+        Ok(())
+    }
+
+    /// Exit four-byte address mode (0xE9).
+    pub async fn exit_4byte_address_mode(&mut self) -> Result<(), Error<S>> {
+        self.spi
+            .write(&[Command::Exit4ByteAddressMode as u8])
+            .await
+            .map_err(Error::SpiError)?;
+
+        self.address_mode = AddressMode::ThreeByte;
+
+        Ok(())
+    }
+
     /// Reset the chip (0x66 followed by 0x99).
     pub async fn reset(&mut self) -> Result<(), Error<S>>
     where
@@ -265,11 +261,8 @@ where
             return Ok(());
         }
 
-        let (header, header_len) = command_and_address_mode(
-            Command::ReadData as u8,
-            address,
-            self.address_mode,
-        );
+        let (header, header_len) =
+            command_and_address_mode(Command::ReadData as u8, address, self.address_mode);
 
         self.spi
             .transaction(&mut [
@@ -298,11 +291,8 @@ where
             return Ok(());
         }
 
-        let (header, header_len) = command_address_dummy_mode(
-            Command::FastRead as u8,
-            address,
-            self.address_mode,
-        );
+        let (header, header_len) =
+            command_address_dummy_mode(Command::FastRead as u8, address, self.address_mode);
 
         self.spi
             .transaction(&mut [
@@ -372,11 +362,8 @@ where
 
         self.enable_write().await?;
 
-        let (header, header_len) = command_and_address_mode(
-            Command::PageProgram as u8,
-            address,
-            self.address_mode,
-        );
+        let (header, header_len) =
+            command_and_address_mode(Command::PageProgram as u8, address, self.address_mode);
 
         self.spi
             .transaction(&mut [
@@ -440,11 +427,8 @@ where
 
         let address: u32 = index * Series::SECTOR_SIZE;
 
-        let (header, header_len) = command_and_address_mode(
-            Command::SectorErase as u8,
-            address,
-            self.address_mode,
-        );
+        let (header, header_len) =
+            command_and_address_mode(Command::SectorErase as u8, address, self.address_mode);
 
         self.spi
             .write(&header[..header_len])
@@ -475,11 +459,8 @@ where
 
         let address: u32 = index * 32768;
 
-        let (header, header_len) = command_and_address_mode(
-            Command::Block32Erase as u8,
-            address,
-            self.address_mode,
-        );
+        let (header, header_len) =
+            command_and_address_mode(Command::Block32Erase as u8, address, self.address_mode);
 
         self.spi
             .write(&header[..header_len])
@@ -510,11 +491,8 @@ where
 
         let address: u32 = index * 65536;
 
-        let (header, header_len) = command_and_address_mode(
-            Command::Block64Erase as u8,
-            address,
-            self.address_mode,
-        );
+        let (header, header_len) =
+            command_and_address_mode(Command::Block64Erase as u8, address, self.address_mode);
 
         self.spi
             .write(&header[..header_len])

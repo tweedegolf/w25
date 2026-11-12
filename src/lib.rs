@@ -134,8 +134,8 @@ pub enum AddressMode {
     /// Traditional 24-bit addressing. For w25(q/x)128 or smaller
     ThreeByte,
 
-    /// 32-bit addressing. For w25(q/x)256 or bigger up to 
-    FourByte, 
+    /// 32-bit addressing. For w25(q/x)256 or bigger up to
+    FourByte,
 }
 
 impl NorSeries for Q {
@@ -300,6 +300,7 @@ pub enum Error<S: Debug> {
     InvalidState,
 }
 
+#[allow(dead_code)]
 #[cfg_attr(not(any(feature = "blocking", feature = "async")), allow(dead_code))]
 #[allow(clippy::identity_op)]
 fn command_and_address(command: u8, address: u32) -> [u8; 4] {
@@ -312,6 +313,7 @@ fn command_and_address(command: u8, address: u32) -> [u8; 4] {
     ]
 }
 
+#[allow(dead_code)]
 #[cfg_attr(not(any(feature = "blocking", feature = "async")), allow(dead_code))]
 #[allow(clippy::identity_op)]
 fn command_address_dummy(command: u8, address: u32) -> [u8; 5] {
@@ -336,27 +338,9 @@ pub(crate) fn command_and_address_mode(
     let bytes = address.to_be_bytes();
 
     match mode {
-        AddressMode::ThreeByte => (
-            [
-                command,
-                bytes[1],
-                bytes[2],
-                bytes[3],
-                0,
-            ],
-            4,
-        ),
+        AddressMode::ThreeByte => ([command, bytes[1], bytes[2], bytes[3], 0], 4),
 
-        AddressMode::FourByte => (
-            [
-                command,
-                bytes[0],
-                bytes[1],
-                bytes[2],
-                bytes[3],
-            ],
-            5,
-        ),
+        AddressMode::FourByte => ([command, bytes[0], bytes[1], bytes[2], bytes[3]], 5),
     }
 }
 
@@ -373,11 +357,7 @@ pub(crate) fn command_address_dummy_mode(
     match mode {
         AddressMode::ThreeByte => (
             [
-                command,
-                bytes[1],
-                bytes[2],
-                bytes[3],
-                0x00, // 8 dummy clocks
+                command, bytes[1], bytes[2], bytes[3], 0x00, // 8 dummy clocks
                 0,
             ],
             5,
@@ -385,12 +365,7 @@ pub(crate) fn command_address_dummy_mode(
 
         AddressMode::FourByte => (
             [
-                command,
-                bytes[0],
-                bytes[1],
-                bytes[2],
-                bytes[3],
-                0x00, // 8 dummy clocks
+                command, bytes[0], bytes[1], bytes[2], bytes[3], 0x00, // 8 dummy clocks
             ],
             6,
         ),
