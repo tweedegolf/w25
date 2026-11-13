@@ -2,6 +2,7 @@ use super::*;
 use core::convert::Infallible;
 use embassy_futures::yield_now;
 use embedded_hal::digital::OutputPin;
+use embedded_hal_async::delay::DelayNs;
 use embedded_hal_async::spi::{Operation, SpiDevice};
 use embedded_storage_async::nor_flash::{MultiwriteNorFlash, NorFlash, ReadNorFlash};
 
@@ -64,6 +65,11 @@ where
             yield_now().await;
         }
 
+        // Automatically select address mode when capacity is known.
+        if flash.capacity > 0x0100_0000 {
+            flash.enter_4byte_address_mode().await?;
+        }
+
         Ok(flash)
     }
 
@@ -81,6 +87,11 @@ where
             .major_device_id()
             .map_err(InitError::DeviceNotRecognized)?;
         flash.capacity = major_id.capacity();
+
+        // This is important for W25(q/x)256 or higher
+        if flash.capacity > 0x0100_0000 {
+            flash.enter_4byte_address_mode().await?;
+        }
 
         Ok(flash)
     }
@@ -174,10 +185,35 @@ where
         Ok((buf[4], buf[5]))
     }
 
+    /// Enter four-byte address mode (0xB7).
+    pub async fn enter_4byte_address_mode(&mut self) -> Result<(), Error<S>> {
+        self.spi
+            .write(&[Command::Enter4ByteAddressMode as u8])
+            .await
+            .map_err(Error::SpiError)?;
+
+        self.address_mode = AddressMode::FourByte;
+
+        Ok(())
+    }
+
+    /// Exit four-byte address mode (0xE9).
+    pub async fn exit_4byte_address_mode(&mut self) -> Result<(), Error<S>> {
+        self.spi
+            .write(&[Command::Exit4ByteAddressMode as u8])
+            .await
+            .map_err(Error::SpiError)?;
+
+        self.address_mode = AddressMode::ThreeByte;
+
+        Ok(())
+    }
+
     /// Reset the chip (0x66 followed by 0x99).
-    pub async fn reset(&mut self) -> Result<(), Error<S>>
+    pub async fn reset<D: DelayNs>(&mut self, delay: &mut D) -> Result<(), Error<S>>
     where
         Series: Reset,
+        D: DelayNs,
     {
         self.spi
             .write(&[Command::EnableReset as u8])
@@ -186,7 +222,19 @@ where
         self.spi
             .write(&[Command::Reset as u8])
             .await
-            .map_err(Error::SpiError)
+            .map_err(Error::SpiError)?;
+
+        // According to the datasheet we need to wait 30 microseconds for the flash to complete its reset recovery time
+        delay.delay_us(100).await;
+
+        // The chip's reset returns its volatile configuration to its reset defaults, including its address mode.
+        // Therefore, simply retaining self.address_mode == FourByte after a reset would be incorrect.
+        // Restore the previously selected mode.
+        if self.capacity > 0x0100_0000 {
+            self.enter_4byte_address_mode().await?;
+        }
+
+        Ok(())
     }
 
     /// Reset Continuous Read Mode (0xFFFF) to return the device to normal SPI
@@ -218,9 +266,12 @@ where
             return Ok(());
         }
 
+        let (header, header_len) =
+            command_and_address_mode(Command::ReadData as u8, address, self.address_mode);
+
         self.spi
             .transaction(&mut [
-                Operation::Write(&command_and_address(Command::ReadData as u8, address)),
+                Operation::Write(&header[..header_len]),
                 Operation::Read(buf),
             ])
             .await
@@ -245,9 +296,12 @@ where
             return Ok(());
         }
 
+        let (header, header_len) =
+            command_address_dummy_mode(Command::FastRead as u8, address, self.address_mode);
+
         self.spi
             .transaction(&mut [
-                Operation::Write(&command_address_dummy(Command::FastRead as u8, address)),
+                Operation::Write(&header[..header_len]),
                 Operation::Read(buf),
             ])
             .await
@@ -283,6 +337,12 @@ where
     pub async fn write(&mut self, mut address: u32, mut buf: &[u8]) -> Result<(), Error<S>> {
         self.check_write(address, buf.len())?;
 
+        // If buffer is empty there is no need to issue a Page Write. Just return without touching
+        // the flash
+        if buf.is_empty() {
+            return Ok(());
+        }
+
         // Write first chunk, taking into account that given addres might
         // point to a location that is not on a page boundary.
         let chunk_len = (Series::PAGE_SIZE - (address & 0x000000FF)) as usize;
@@ -313,9 +373,12 @@ where
 
         self.enable_write().await?;
 
+        let (header, header_len) =
+            command_and_address_mode(Command::PageProgram as u8, address, self.address_mode);
+
         self.spi
             .transaction(&mut [
-                Operation::Write(&command_and_address(Command::PageProgram as u8, address)),
+                Operation::Write(&header[..header_len]),
                 Operation::Write(buf),
             ])
             .await
@@ -375,8 +438,11 @@ where
 
         let address: u32 = index * Series::SECTOR_SIZE;
 
+        let (header, header_len) =
+            command_and_address_mode(Command::SectorErase as u8, address, self.address_mode);
+
         self.spi
-            .write(&command_and_address(Command::SectorErase as u8, address))
+            .write(&header[..header_len])
             .await
             .map_err(Error::SpiError)?;
 
@@ -402,10 +468,13 @@ where
 
         self.enable_write().await?;
 
-        let address: u32 = index * 32768;
+        let address = index.checked_mul(32768).ok_or(Error::OutOfBounds)?;
+
+        let (header, header_len) =
+            command_and_address_mode(Command::Block32Erase as u8, address, self.address_mode);
 
         self.spi
-            .write(&command_and_address(Command::Block32Erase as u8, address))
+            .write(&header[..header_len])
             .await
             .map_err(Error::SpiError)?;
 
@@ -431,10 +500,13 @@ where
 
         self.enable_write().await?;
 
-        let address: u32 = index * 65536;
+        let address = index.checked_mul(65536).ok_or(Error::OutOfBounds)?;
+
+        let (header, header_len) =
+            command_and_address_mode(Command::Block64Erase as u8, address, self.address_mode);
 
         self.spi
-            .write(&command_and_address(Command::Block64Erase as u8, address))
+            .write(&header[..header_len])
             .await
             .map_err(Error::SpiError)?;
 

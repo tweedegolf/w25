@@ -81,6 +81,7 @@ mod hal_common {
                 hold,
                 wp,
                 capacity,
+                address_mode: AddressMode::ThreeByte,
                 _phantom: PhantomData,
             })
         }
@@ -125,6 +126,16 @@ pub trait NorSeries {
     const SECTOR_SIZE: u32;
     /// True if the series has a second status register (SR2) and supports Quad/Suspend features.
     const HAS_SR2: bool;
+}
+
+/// Addressing mode used by the flash driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressMode {
+    /// Traditional 24-bit addressing. For w25(q/x)128 or smaller
+    ThreeByte,
+
+    /// 32-bit addressing. For w25(q/x)256 or bigger up to
+    FourByte,
 }
 
 impl NorSeries for Q {
@@ -181,6 +192,8 @@ enum Command {
     ModeBitReset = 0xFF,        // Q only (0xFFFF for Dual I/O).
     EnableReset = 0x66,         // Q only.
     Reset = 0x99,               // Q only.
+    Enter4ByteAddressMode = 0xB7,
+    Exit4ByteAddressMode = 0xE9,
 }
 
 /// Low level driver for the w25 flash memory chip.
@@ -190,6 +203,7 @@ pub struct W25<Series, SPI, HOLD, WP> {
     pub(crate) hold: HOLD,
     pub(crate) wp: WP,
     pub(crate) capacity: u32,
+    pub(crate) address_mode: AddressMode,
     _phantom: PhantomData<Series>,
 }
 
@@ -214,20 +228,28 @@ impl<Series: NorSeries, SPI, HOLD, WP> W25<Series, SPI, HOLD, WP> {
 
     #[inline]
     pub(crate) fn check_read<S: Debug>(&self, offset: u32, len: usize) -> Result<(), Error<S>> {
-        if offset.saturating_add(len as u32) > self.capacity {
-            Err(Error::OutOfBounds)
-        } else {
-            Ok(())
+        let len = u32::try_from(len).map_err(|_| Error::OutOfBounds)?;
+
+        let end = offset.checked_add(len).ok_or(Error::OutOfBounds)?;
+
+        if end > self.capacity {
+            return Err(Error::OutOfBounds);
         }
+
+        Ok(())
     }
 
     #[inline]
     pub(crate) fn check_write<S: Debug>(&self, offset: u32, len: usize) -> Result<(), Error<S>> {
-        if offset.saturating_add(len as u32) > self.capacity {
-            Err(Error::OutOfBounds)
-        } else {
-            Ok(())
+        let len = u32::try_from(len).map_err(|_| Error::OutOfBounds)?;
+
+        let end = offset.checked_add(len).ok_or(Error::OutOfBounds)?;
+
+        if end > self.capacity {
+            return Err(Error::OutOfBounds);
         }
+
+        Ok(())
     }
 
     #[inline]
@@ -286,6 +308,7 @@ pub enum Error<S: Debug> {
     InvalidState,
 }
 
+#[allow(dead_code)]
 #[cfg_attr(not(any(feature = "blocking", feature = "async")), allow(dead_code))]
 #[allow(clippy::identity_op)]
 fn command_and_address(command: u8, address: u32) -> [u8; 4] {
@@ -298,6 +321,7 @@ fn command_and_address(command: u8, address: u32) -> [u8; 4] {
     ]
 }
 
+#[allow(dead_code)]
 #[cfg_attr(not(any(feature = "blocking", feature = "async")), allow(dead_code))]
 #[allow(clippy::identity_op)]
 fn command_address_dummy(command: u8, address: u32) -> [u8; 5] {
@@ -309,6 +333,51 @@ fn command_address_dummy(command: u8, address: u32) -> [u8; 5] {
         ((address & 0x0000FF) >> 0) as u8,
         0x00, // 8 dummy clocks.
     ]
+}
+
+/// Build a command header using the selected address mode.
+///
+/// Returns the header and its actual length.
+pub(crate) fn command_and_address_mode(
+    command: u8,
+    address: u32,
+    mode: AddressMode,
+) -> ([u8; 5], usize) {
+    let bytes = address.to_be_bytes();
+
+    match mode {
+        AddressMode::ThreeByte => ([command, bytes[1], bytes[2], bytes[3], 0], 4),
+
+        AddressMode::FourByte => ([command, bytes[0], bytes[1], bytes[2], bytes[3]], 5),
+    }
+}
+
+/// Build a fast-read command header using the selected address mode.
+///
+/// Returns the header and its actual length.
+pub(crate) fn command_address_dummy_mode(
+    command: u8,
+    address: u32,
+    mode: AddressMode,
+) -> ([u8; 6], usize) {
+    let bytes = address.to_be_bytes();
+
+    match mode {
+        AddressMode::ThreeByte => (
+            [
+                command, bytes[1], bytes[2], bytes[3], 0x00, // 8 dummy clocks
+                0,
+            ],
+            5,
+        ),
+
+        AddressMode::FourByte => (
+            [
+                command, bytes[0], bytes[1], bytes[2], bytes[3], 0x00, // 8 dummy clocks
+            ],
+            6,
+        ),
+    }
 }
 
 /// Major byte of the device identification (ID7-ID0) denoting chip capacity.
@@ -407,5 +476,200 @@ impl JedecId {
     /// variant of the chip.
     pub const fn minor_device_id(&self) -> u8 {
         self.0[1]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Test the address-range validation using a minimal W25 instance.
+    fn make_test_flash() -> W25<Q, (), (), ()> {
+        W25 {
+            spi: (),
+            hold: (),
+            wp: (),
+            capacity: 32 * 1024 * 1024,
+            address_mode: AddressMode::FourByte,
+            _phantom: PhantomData,
+        }
+    }
+
+    #[test]
+    fn check_write_accepts_last_valid_byte() {
+        let flash = make_test_flash();
+
+        assert!(
+            flash
+                .check_write::<core::convert::Infallible>(0x01FF_FFFF, 1)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn check_write_rejects_write_past_end() {
+        let flash = make_test_flash();
+
+        assert!(
+            flash
+                .check_write::<core::convert::Infallible>(0x01FF_FFFF, 2)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn check_write_accepts_empty_write_at_end() {
+        let flash = make_test_flash();
+
+        assert!(
+            flash
+                .check_write::<core::convert::Infallible>(0x0200_0000, 0)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn check_write_rejects_write_starting_at_end() {
+        let flash = make_test_flash();
+
+        assert!(
+            flash
+                .check_write::<core::convert::Infallible>(0x0200_0000, 1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn check_write_rejects_integer_overflow() {
+        let flash = make_test_flash();
+
+        assert!(
+            flash
+                .check_write::<core::convert::Infallible>(0xFFFF_FFFF, 2)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn check_read_accepts_last_valid_byte() {
+        let flash = make_test_flash();
+        assert!(
+            flash
+                .check_read::<core::convert::Infallible>(0x01FF_FFFF, 1)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn check_read_accepts_empty_read_at_end() {
+        let flash = make_test_flash();
+        assert!(
+            flash
+                .check_read::<core::convert::Infallible>(0x0200_0000, 0)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn check_read_rejects_read_starting_at_end() {
+        let flash = make_test_flash();
+        assert!(
+            flash
+                .check_read::<core::convert::Infallible>(0x0200_0000, 1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn check_read_rejects_read_past_end() {
+        let flash = make_test_flash();
+        assert!(
+            flash
+                .check_read::<core::convert::Infallible>(0x01FF_FFFF, 2)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn check_read_rejects_integer_overflow() {
+        let flash = make_test_flash();
+        assert!(
+            flash
+                .check_read::<core::convert::Infallible>(0xFFFF_FFFF, 2)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn check_erase_accepts_full_flash() {
+        let flash = make_test_flash();
+
+        assert!(
+            flash
+                .check_erase::<core::convert::Infallible>(0, 0x0200_0000)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn check_erase_accepts_last_sector() {
+        let flash = make_test_flash();
+
+        assert!(
+            flash
+                .check_erase::<core::convert::Infallible>(0x01FF_F000, 0x0200_0000)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn check_erase_rejects_range_past_end() {
+        let flash = make_test_flash();
+
+        assert!(
+            flash
+                .check_erase::<core::convert::Infallible>(0x01FF_F000, 0x0200_1000)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn check_erase_rejects_reversed_range() {
+        let flash = make_test_flash();
+
+        assert!(
+            flash
+                .check_erase::<core::convert::Infallible>(0x2000, 0x1000)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn check_erase_rejects_unaligned_range() {
+        let flash = make_test_flash();
+
+        assert!(
+            flash
+                .check_erase::<core::convert::Infallible>(0x1001, 0x2000)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn check_erase_accepts_empty_range_at_start() {
+        let flash = make_test_flash();
+
+        assert!(flash.check_erase::<core::convert::Infallible>(0, 0).is_ok());
+    }
+
+    #[test]
+    fn check_erase_accepts_empty_range_at_end() {
+        let flash = make_test_flash();
+
+        assert!(
+            flash
+                .check_erase::<core::convert::Infallible>(0x0200_0000, 0x0200_0000)
+                .is_ok()
+        );
     }
 }
